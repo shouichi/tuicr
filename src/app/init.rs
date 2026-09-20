@@ -576,6 +576,7 @@ impl App {
             compact_folders: false,
             is_pristine_mode: false,
             is_single_file_view: false,
+            review_undo: Vec::new(),
             revealed_reviewed_file: None,
             revealed_reviewed_hunk: None,
             primed_walk_next: false,
