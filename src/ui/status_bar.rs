@@ -707,6 +707,7 @@ mod header_snapshot_tests {
             state: if closed { "CLOSED" } else { "OPEN" }.to_string(),
             closed,
             merged,
+            patch_sets: Default::default(),
         }
     }
 
