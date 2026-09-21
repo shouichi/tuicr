@@ -934,6 +934,8 @@ impl App {
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
+            let checkout_warning =
+                checkout_pr_branch(&summary_repo, local_checkout.as_deref(), pr_number);
             let backend = create_forge_backend(
                 &summary_repo,
                 local_checkout,
@@ -946,6 +948,7 @@ impl App {
             let _ = tx.send(PrOpenEvent::Done {
                 request,
                 result: outcome,
+                checkout_warning,
             });
         });
     }
@@ -966,7 +969,11 @@ impl App {
         let in_flight = self.pr_open_state.clone();
         self.pr_open_state = None;
         match event {
-            PrOpenEvent::Done { request, result } => {
+            PrOpenEvent::Done {
+                request,
+                result,
+                checkout_warning,
+            } => {
                 // If the user cancelled (cleared pr_open_state) but the
                 // background thread sent a result before being torn down,
                 // ignore the result rather than entering PR mode.
@@ -991,6 +998,8 @@ impl App {
                                 "Failed to open PR #{}: {}",
                                 request.pr_number, e
                             ));
+                        } else if let Some(warning) = checkout_warning {
+                            self.set_warning(warning);
                         }
                     }
                     Err(e) => {

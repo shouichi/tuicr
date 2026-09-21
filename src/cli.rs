@@ -162,6 +162,11 @@ enum Subcmd {
         #[arg(value_name = "VERSION")]
         version: Option<semver::Version>,
     },
+    /// Print a shell completion script.
+    Completions {
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Explicit `tuicr tui` entrypoint. With no nested command, opens the local
@@ -360,6 +365,7 @@ impl From<Cli> for CliArgs {
                 (TuiOptions::default(), None, Some(command), None, false)
             }
             Some(Subcmd::Update { version }) => (TuiOptions::default(), None, None, version, true),
+            Some(Subcmd::Completions { .. }) => unreachable!("handled in parse_cli_args"),
             None => (cli.tui_options, None, None, None, false),
         };
         Self {
@@ -443,6 +449,7 @@ impl Cli {
         match self.command {
             Some(Subcmd::Review { .. }) => Some("review"),
             Some(Subcmd::Update { .. }) => Some("update"),
+            Some(Subcmd::Completions { .. }) => Some("completions"),
             _ => None,
         }
     }
@@ -509,7 +516,13 @@ fn non_empty_comment_text(s: &str) -> Result<String, String> {
 /// Parse CLI arguments from `std::env::args`. On `--help`/`--version`/parse
 /// errors, clap prints to stdout/stderr and exits the process.
 pub fn parse_cli_args() -> CliArgs {
-    match Cli::parse().try_into_args() {
+    let cli = Cli::parse();
+    if let Some(Subcmd::Completions { shell }) = cli.command {
+        use clap::CommandFactory;
+        clap_complete::generate(shell, &mut Cli::command(), "tuicr", &mut std::io::stdout());
+        std::process::exit(0);
+    }
+    match cli.try_into_args() {
         Ok(args) => args,
         Err(err) => err.exit(),
     }

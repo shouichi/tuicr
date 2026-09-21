@@ -508,14 +508,21 @@ pub fn render_help(frame: &mut Frame, app: &mut App) {
                 "  r         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Toggle file reviewed"),
+            Span::raw("Toggle hunk reviewed"),
         ]),
         Line::from(vec![
             Span::styled(
                 "  R         ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw("Toggle hunk reviewed"),
+            Span::raw("Toggle file reviewed"),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  u         ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("Undo the last reviewed mark"),
         ]),
         Line::from(vec![
             Span::styled(
