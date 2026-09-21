@@ -31,8 +31,8 @@ use crate::forge::remote_comments::RemoteReviewThread;
 use crate::forge::submit::{GhSide, InlineComment, SubmitEvent};
 use crate::forge::traits::{
     CreateReviewRequest, ForgeBackend, ForgeFileLinesRequest, ForgeRepository,
-    GhCreateReviewResponse, PagedPullRequests, PullRequestCommit, PullRequestDetails,
-    PullRequestListQuery, PullRequestListScope, PullRequestTarget,
+    GhCreateReviewResponse, PagedPullRequests, PatchSetRange, PullRequestCommit,
+    PullRequestDetails, PullRequestListQuery, PullRequestListScope, PullRequestTarget,
 };
 use crate::model::{DiffLine, FilePatch};
 use crate::process::run_command_output;
@@ -55,6 +55,10 @@ const USER_ENV_VAR: &str = "GERRIT_USERNAME";
 /// Gerrit HTTP password (Settings → HTTP Credentials), not the account
 /// password.
 const PASSWORD_ENV_VAR: &str = "GERRIT_PASSWORD";
+/// PEM certificate chain and private key presented when the server asks for a
+/// client certificate (mutual TLS). Set both or neither.
+const CLIENT_CERT_ENV_VAR: &str = "GERRIT_CLIENT_CERT";
+const CLIENT_KEY_ENV_VAR: &str = "GERRIT_CLIENT_KEY";
 /// Label a review vote is cast on. `Code-Review` is Gerrit's out-of-the-box
 /// review label and is present on every default install.
 const REVIEW_LABEL: &str = "Code-Review";
@@ -88,25 +92,38 @@ pub trait GerritHttp: Send + Sync {
     fn is_authenticated(&self) -> bool;
 }
 
-/// Direct REST transport, optionally with HTTP Basic credentials.
+/// Direct REST transport, optionally with HTTP Basic credentials and a client
+/// certificate. Server certificates are verified against the OS trust store, so
+/// a private CA trusted there works.
 pub struct HttpsGerrit {
     auth_header: Option<String>,
-    agent: ureq::Agent,
+    /// `Err` when a configured client certificate could not be loaded; every
+    /// request then fails with that message.
+    agent: std::result::Result<ureq::Agent, String>,
 }
 
 impl HttpsGerrit {
-    pub fn new(credentials: Option<(String, String)>) -> Self {
+    pub fn new(
+        credentials: Option<(String, String)>,
+        client_cert: std::result::Result<Option<ureq::tls::ClientCert>, String>,
+    ) -> Self {
         let auth_header = credentials.map(|(user, password)| {
             format!("Basic {}", BASE64.encode(format!("{user}:{password}")))
         });
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build();
-        Self {
-            auth_header,
-            agent: config.into(),
-        }
+        let agent = client_cert.map(|client_cert| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                        .client_cert(client_cert)
+                        .build(),
+                )
+                .build()
+                .into()
+        });
+        Self { auth_header, agent }
     }
 
     /// Refuse to put the HTTP Basic header on a plaintext request.
@@ -153,14 +170,21 @@ impl GerritHttp for HttpsGerrit {
 
     fn request(&self, method: &str, url: &str, body: Option<&str>) -> GerritHttpResult<String> {
         self.reject_plaintext_credentials(url)?;
+        let agent = self
+            .agent
+            .as_ref()
+            .map_err(|body| GerritHttpError::Failed {
+                status: None,
+                body: body.clone(),
+            })?;
         // `ureq` gives with-body and without-body builders different types, so
         // the body-carrying methods share one arm and GET gets its own.
         let result = match method.to_ascii_uppercase().as_str() {
-            "GET" => self.authorized(self.agent.get(url)).call(),
+            "GET" => self.authorized(agent.get(url)).call(),
             verb @ ("POST" | "PUT") => {
                 let builder = match verb {
-                    "POST" => self.agent.post(url),
-                    _ => self.agent.put(url),
+                    "POST" => agent.post(url),
+                    _ => agent.put(url),
                 };
                 self.authorized(builder)
                     .header("Content-Type", "application/json")
@@ -206,6 +230,40 @@ fn credentials_from_env() -> Option<(String, String)> {
     let user = non_empty_env(USER_ENV_VAR)?;
     let password = non_empty_env(PASSWORD_ENV_VAR)?;
     Some((user, password))
+}
+
+/// Client certificate from the environment, when both paths are set.
+fn client_cert_from_env() -> std::result::Result<Option<ureq::tls::ClientCert>, String> {
+    match (
+        non_empty_env(CLIENT_CERT_ENV_VAR),
+        non_empty_env(CLIENT_KEY_ENV_VAR),
+    ) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => load_client_cert(Path::new(&cert), Path::new(&key)).map(Some),
+        _ => Err(format!(
+            "set both {CLIENT_CERT_ENV_VAR} and {CLIENT_KEY_ENV_VAR}, or neither"
+        )),
+    }
+}
+
+fn load_client_cert(cert: &Path, key: &Path) -> std::result::Result<ureq::tls::ClientCert, String> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+    };
+    let chain = ureq::tls::parse_pem(&read(cert)?)
+        .filter_map(|item| match item {
+            Ok(ureq::tls::PemItem::Certificate(cert)) => Some(Ok(cert)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("cannot parse {}: {err}", cert.display()))?;
+    if chain.is_empty() {
+        return Err(format!("no certificate in {}", cert.display()));
+    }
+    let key = ureq::tls::PrivateKey::from_pem(&read(key)?)
+        .map_err(|err| format!("cannot parse {}: {err}", key.display()))?;
+    Ok(ureq::tls::ClientCert::new_with_certs(&chain, key))
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -319,7 +377,10 @@ impl GerritBackend {
     pub fn new(default_repository: Option<ForgeRepository>) -> Self {
         Self {
             default_repository,
-            http: Box::new(HttpsGerrit::new(credentials_from_env())),
+            http: Box::new(HttpsGerrit::new(
+                credentials_from_env(),
+                client_cert_from_env(),
+            )),
             local_checkout: None,
         }
     }
@@ -390,11 +451,22 @@ impl GerritBackend {
             .map_err(|err| map_http_error(err, &web_base(repo)))
     }
 
-    /// Fetch one change with everything the detail view needs.
-    fn fetch_change(&self, repo: &ForgeRepository, number: u64) -> Result<GerritChange> {
+    /// Fetch one change with everything the detail view needs. Picking a
+    /// patch set other than the current one needs every revision.
+    fn fetch_change(
+        &self,
+        repo: &ForgeRepository,
+        number: u64,
+        patch_sets: PatchSetRange,
+    ) -> Result<GerritChange> {
+        let revisions = if patch_sets == PatchSetRange::default() {
+            "o=CURRENT_REVISION&o=CURRENT_COMMIT"
+        } else {
+            "o=ALL_REVISIONS&o=ALL_COMMITS"
+        };
         self.get_json(
             repo,
-            &format!("/changes/{number}/?o=CURRENT_REVISION&o=CURRENT_COMMIT&o=DETAILED_ACCOUNTS"),
+            &format!("/changes/{number}/?{revisions}&o=DETAILED_ACCOUNTS"),
         )
     }
 
@@ -408,19 +480,23 @@ impl GerritBackend {
         let Some(remote) = remote_for_repository(root, &pr.repository) else {
             return false;
         };
-        let Some(ref_name) = patch_set_ref(pr) else {
+        let base_ref = pr
+            .patch_sets
+            .base
+            .map(|patch_set| change_ref(pr.number, u64::from(patch_set)));
+        let refs: Vec<String> = patch_set_ref(pr).into_iter().chain(base_ref).collect();
+        if refs.is_empty() {
             return false;
-        };
+        }
         // A bare `git fetch <remote> <ref>` writes FETCH_HEAD only — it creates
         // no branch and moves no existing ref in the user's repo. That holds
-        // only because [`patch_set_ref`] rebuilt `ref_name` out of digits: a
+        // only because [`patch_set_ref`] rebuilt the refs out of digits: a
         // server-controlled value in this position is both an option and a
         // refspec, and would otherwise be free to move a local ref.
-        let _ = run_command_output(
-            "git",
-            Some(root),
-            ["fetch", "--quiet", remote.as_str(), ref_name.as_str()],
-        );
+        let args = ["fetch", "--quiet", remote.as_str()]
+            .into_iter()
+            .chain(refs.iter().map(String::as_str));
+        let _ = run_command_output("git", Some(root), args);
         sha_present(root, &pr.base_sha) && sha_present(root, &pr.head_sha)
     }
 
@@ -558,9 +634,15 @@ impl ForgeBackend for GerritBackend {
 
     fn get_pull_request(&self, target: PullRequestTarget) -> Result<PullRequestDetails> {
         let repository = self.resolve_repository(&target)?;
-        let change = self.fetch_change(&repository, target.number)?;
+        let change = self.fetch_change(&repository, target.number, target.patch_sets)?;
+        if let Some(patch_set) = change.missing_patch_set(target.patch_sets) {
+            return Err(TuicrError::Forge(format!(
+                "Gerrit change {} has no patch set {patch_set}",
+                target.number
+            )));
+        }
         let base = web_base(&repository);
-        Ok(change.into_details(&repository, &base))
+        Ok(change.into_details(&repository, &base, target.patch_sets))
     }
 
     fn get_pull_request_diff(&self, pr: &PullRequestDetails) -> Result<Vec<FilePatch>> {
@@ -609,12 +691,13 @@ impl ForgeBackend for GerritBackend {
             comments,
             &pr.url,
             patch_set_from_ref(&pr.head_ref_name),
+            pr.patch_sets.base,
         ))
     }
 
     fn list_pull_request_commits(&self, pr: &PullRequestDetails) -> Result<Vec<PullRequestCommit>> {
-        let change = self.fetch_change(&pr.repository, pr.number)?;
-        Ok(change.into_commits())
+        let change = self.fetch_change(&pr.repository, pr.number, pr.patch_sets)?;
+        Ok(change.into_commits(pr.patch_sets.head))
     }
 
     fn create_review(
@@ -626,6 +709,16 @@ impl ForgeBackend for GerritBackend {
             return Err(TuicrError::Forge(format!(
                 "Submitting to Gerrit needs credentials. Set {USER_ENV_VAR} and \
                  {PASSWORD_ENV_VAR} (Settings → HTTP Credentials in Gerrit)."
+            )));
+        }
+        // Gerrit files a left-side comment of a patch set comparison on the
+        // base patch set, which a review of the head revision cannot carry.
+        if let Some(base) = pr.patch_sets.base
+            && request.comments.iter().any(|c| c.side == GhSide::Left)
+        {
+            return Err(TuicrError::Forge(format!(
+                "Comments on the patch set {base} side cannot be submitted. Move them to \
+                 the right side or into the summary."
             )));
         }
 
@@ -735,13 +828,14 @@ fn patch_set_ref(pr: &PullRequestDetails) -> Option<String> {
     let shard = parts.next()?;
     let change: u64 = parts.next()?.parse().ok()?;
     let patch_set: u64 = parts.next()?.parse().ok()?;
-    let expected_shard = format!("{:02}", change % 100);
-    if parts.next().is_some() || change != pr.number || shard != expected_shard {
+    if parts.next().is_some() || change != pr.number || shard != format!("{:02}", change % 100) {
         return None;
     }
-    Some(format!(
-        "refs/changes/{expected_shard}/{change}/{patch_set}"
-    ))
+    Some(change_ref(change, patch_set))
+}
+
+fn change_ref(change: u64, patch_set: u64) -> String {
+    format!("refs/changes/{:02}/{change}/{patch_set}", change % 100)
 }
 
 /// Patch-set number carried by a change ref (`refs/changes/65/3965/2` → 2).
@@ -1004,7 +1098,9 @@ fn repository_from_path(host: &str, path: &str) -> Option<ForgeRepository> {
 /// Parse a change target: a bare number or a Gerrit change URL.
 ///
 /// Handles the modern `/c/<project>/+/<number>` shape and the legacy
-/// `/#/c/<number>` one, with an optional trailing patch-set segment.
+/// `/#/c/<number>` one. Either form, and the bare number, takes a patch-set
+/// segment as Gerrit's web UI writes it: `<head>` or `<base>..<head>`, plus
+/// `<base>..` for the current patch set against `<base>`.
 pub fn parse_pull_request_target_gerrit(input: &str) -> Result<PullRequestTarget> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -1012,6 +1108,12 @@ pub fn parse_pull_request_target_gerrit(input: &str) -> Result<PullRequestTarget
     }
     if let Some(number) = positive_number(trimmed) {
         return Ok(PullRequestTarget::number(number, trimmed));
+    }
+    if let Some((number, patch_sets)) = trimmed.split_once('/')
+        && let Some(number) = positive_number(number)
+        && let Some(patch_sets) = parse_patch_sets(patch_sets)
+    {
+        return Ok(PullRequestTarget::number(number, trimmed).with_patch_sets(patch_sets));
     }
     if let Some(target) = parse_gerrit_url_target(trimmed) {
         return Ok(target);
@@ -1034,25 +1136,47 @@ fn parse_gerrit_url_target(target: &str) -> Option<PullRequestTarget> {
         .collect();
     let change_at = segments.iter().position(|segment| *segment == "c")?;
     // Modern: c/<project…>/+/<n>. Legacy: c/<n> (project omitted).
-    let (project, number) = match segments.iter().position(|segment| *segment == "+") {
-        Some(plus) if plus > change_at => (
-            segments[change_at + 1..plus].join("/"),
-            positive_number(segments.get(plus + 1)?)?,
-        ),
-        _ => (
-            String::new(),
-            positive_number(segments.get(change_at + 1)?)?,
-        ),
+    let (project, number_at) = match segments.iter().position(|segment| *segment == "+") {
+        Some(plus) if plus > change_at => (segments[change_at + 1..plus].join("/"), plus + 1),
+        _ => (String::new(), change_at + 1),
     };
+    let number = positive_number(segments.get(number_at)?)?;
+    // Anything else after the number (`comment/<id>`, a file path) is not a
+    // patch-set selection and leaves the default comparison.
+    let patch_sets = segments
+        .get(number_at + 1)
+        .and_then(|segment| parse_patch_sets(segment))
+        .unwrap_or_default();
 
-    if project.is_empty() {
-        Some(PullRequestTarget::number(number, target))
+    let target = if project.is_empty() {
+        PullRequestTarget::number(number, target)
     } else {
-        Some(PullRequestTarget::with_repository(
+        PullRequestTarget::with_repository(
             ForgeRepository::gerrit(host.to_ascii_lowercase(), project),
             number,
             target,
-        ))
+        )
+    };
+    Some(target.with_patch_sets(patch_sets))
+}
+
+/// `<head>`, `<base>..<head>` or `<base>..`.
+fn parse_patch_sets(segment: &str) -> Option<PatchSetRange> {
+    let patch_set =
+        |value: &str| positive_number(value).and_then(|number| u32::try_from(number).ok());
+    match segment.split_once("..") {
+        None => Some(PatchSetRange {
+            base: None,
+            head: Some(patch_set(segment)?),
+        }),
+        Some((base, "")) => Some(PatchSetRange {
+            base: Some(patch_set(base)?),
+            head: None,
+        }),
+        Some((base, head)) => Some(PatchSetRange {
+            base: Some(patch_set(base)?),
+            head: Some(patch_set(head)?),
+        }),
     }
 }
 
@@ -1321,6 +1445,38 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_patch_set_selections_off_bare_numbers_and_urls() {
+        let range = |base, head| PatchSetRange { base, head };
+        for (input, patch_sets) in [
+            ("3965/2", range(None, Some(2))),
+            ("3965/1..2", range(Some(1), Some(2))),
+            ("3965/1..", range(Some(1), None)),
+            (
+                "https://gerrit.example.com/c/platform/base/+/3965/1..2",
+                range(Some(1), Some(2)),
+            ),
+            (
+                "https://gerrit.example.com/#/c/3965/2/",
+                range(None, Some(2)),
+            ),
+            (
+                "https://gerrit.example.com/c/platform/base/+/3965/comment/abc/",
+                range(None, None),
+            ),
+        ] {
+            let target = parse_pull_request_target_gerrit(input).expect(input);
+            assert_eq!(target.number, 3965, "{input}");
+            assert_eq!(target.patch_sets, patch_sets, "{input}");
+        }
+        for input in ["3965/x", "3965/0..2", "3965/..2"] {
+            assert!(
+                parse_pull_request_target_gerrit(input).is_err(),
+                "{input} should not parse"
+            );
+        }
+    }
+
+    #[test]
     fn should_reject_targets_that_are_not_gerrit_changes() {
         for target in ["", "not-a-change", "https://github.com/agavra/tuicr/pull/5"] {
             assert!(
@@ -1457,6 +1613,7 @@ mod tests {
             closed: false,
             merged_at: None,
             diff_start_sha: None,
+            patch_sets: Default::default(),
         }
     }
 
@@ -1576,6 +1733,30 @@ mod tests {
     }
 
     #[test]
+    fn should_refuse_base_side_comments_when_comparing_patch_sets() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let (backend, http) = backend_with(true, vec![")]}'\n{}"]);
+        let mut pr = details();
+        pr.patch_sets.base = Some(1);
+        let comments = vec![inline_comment(20, None, GhSide::Left)];
+        // when
+        let result = backend.create_review(
+            &pr,
+            CreateReviewRequest {
+                event: SubmitEvent::Comment,
+                commit_id: "abc1234",
+                body: "",
+                comments: &comments,
+            },
+        );
+        // then — `side: PARENT` would land on the parent, not patch set 1
+        assert!(result.is_err());
+        assert!(http.calls().is_empty());
+    }
+
+    #[test]
     fn should_vote_minus_one_rather_than_veto_when_requesting_changes() {
         // given — -2 is a hard block, stronger than "request changes" elsewhere
         assert_eq!(review_vote(SubmitEvent::RequestChanges), Some(-1));
@@ -1626,7 +1807,7 @@ mod tests {
     #[test]
     fn should_refuse_to_send_credentials_over_plaintext_http() {
         // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
+        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())), Ok(None));
         // when — no request is made; the guard fires first
         let result = http.request(
             "GET",
@@ -1648,7 +1829,7 @@ mod tests {
     #[test]
     fn should_allow_plaintext_when_there_are_no_credentials_to_leak() {
         // given — anonymous reads over http:// stay usable
-        let http = HttpsGerrit::new(None);
+        let http = HttpsGerrit::new(None, Ok(None));
         // when
         let refused = http
             .reject_plaintext_credentials("http://review.internal/changes/")
@@ -1660,12 +1841,27 @@ mod tests {
     #[test]
     fn should_allow_credentials_over_https() {
         // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
+        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())), Ok(None));
         // when/then
         assert!(
             http.reject_plaintext_credentials("https://review.internal/a/changes/")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn should_fail_every_request_when_the_client_cert_cannot_load() {
+        // given
+        let missing = Path::new("/nonexistent/cert.crt");
+        let http = HttpsGerrit::new(None, load_client_cert(missing, missing).map(Some));
+        // when
+        let result = http.request("GET", "https://review.internal/changes/", None);
+        // then
+        let GerritHttpError::Failed { status, body } = result.expect_err("refused") else {
+            panic!("a broken client cert should not read as an auth failure");
+        };
+        assert_eq!(status, None);
+        assert!(body.contains("/nonexistent/cert.crt"), "{body}");
     }
 
     #[test]
@@ -1790,6 +1986,43 @@ mod tests {
             threads[0].is_outdated,
             "patch set 1 is behind the change's current 2"
         );
+    }
+
+    #[test]
+    fn should_open_the_requested_patch_sets_and_reject_missing_ones() {
+        // given
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::remove_var(URL_ENV_VAR) };
+        let change = r#")]}'
+            {"_number": 3965, "project": "platform/base", "status": "NEW",
+             "current_revision": "bbb",
+             "revisions": {
+                "aaa": {"_number": 1, "ref": "refs/changes/65/3965/1",
+                        "commit": {"message": "m", "parents": [{"commit": "ppp"}]}},
+                "bbb": {"_number": 2, "ref": "refs/changes/65/3965/2",
+                        "commit": {"message": "m", "parents": [{"commit": "ppp"}]}}
+             }}"#;
+        let (backend, http) = backend_with(true, vec![change, change]);
+        let patch_sets = PatchSetRange {
+            base: Some(1),
+            head: None,
+        };
+        let target = PullRequestTarget::number(3965, "3965/1..").with_patch_sets(patch_sets);
+        // when
+        let pr = backend.get_pull_request(target).expect("details");
+        let missing = backend.get_pull_request(
+            PullRequestTarget::number(3965, "3965/3").with_patch_sets(PatchSetRange {
+                base: None,
+                head: Some(3),
+            }),
+        );
+        // then
+        assert!(http.calls()[0].1.contains("o=ALL_REVISIONS"));
+        assert_eq!(pr.base_sha, "aaa");
+        assert_eq!(pr.head_sha, "bbb");
+        assert_eq!(pr.head_ref_name, "refs/changes/65/3965/2");
+        assert_eq!(pr.patch_sets, patch_sets);
+        assert!(missing.is_err());
     }
 
     #[test]
