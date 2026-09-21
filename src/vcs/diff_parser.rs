@@ -83,7 +83,10 @@ fn parse_hunks(
         }
     }
 
-    Ok(hunks)
+    Ok(hunks
+        .into_iter()
+        .flat_map(DiffHunk::split_at_change_runs)
+        .collect())
 }
 
 fn parse_hunk<'a, I>(
@@ -337,13 +340,43 @@ mod tests {
         let files =
             parse("@@ -1,5 +1,2 @@\n----\n-title: hello\n----\n intro\n-old body\n+new body\n")
                 .unwrap();
-        let lines = &files[0].hunks[0].lines;
+        let lines: Vec<_> = files[0].hunks.iter().flat_map(|h| &h.lines).collect();
 
         assert_eq!(lines.len(), 6);
         assert_eq!(lines[0].content, "---");
         assert_eq!(lines[0].old_lineno, Some(1));
         assert_eq!(lines[3].old_lineno, Some(4));
         assert_eq!(lines[4].old_lineno, Some(5));
+    }
+
+    #[test]
+    fn splits_a_hunk_at_each_run_of_changes() {
+        let files = parse("@@ -1,6 +1,6 @@ fn f\n a\n-b\n+B\n c\n d\n-e\n+E\n f\n").unwrap();
+        let hunks = &files[0].hunks;
+
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1,2 +1,2 @@ fn f");
+        assert_eq!(hunks[0].lines.len(), 3);
+        assert_eq!(hunks[1].header, "@@ -3,4 +3,4 @@ fn f");
+        assert_eq!(
+            (hunks[1].old_start, hunks[1].new_start),
+            (3, 3),
+            "the second run starts at the context above it"
+        );
+        assert_eq!(
+            hunks[1].lines.len(),
+            5,
+            "trailing context stays with the last run"
+        );
+    }
+
+    #[test]
+    fn keeps_a_hunk_with_one_run_of_changes_whole() {
+        let header = "@@ -1,3 +1,3 @@ fn f";
+        let files = parse(&format!("{header}\n a\n-b\n+B\n c\n")).unwrap();
+
+        assert_eq!(files[0].hunks.len(), 1);
+        assert_eq!(files[0].hunks[0].header, header);
     }
 
     #[test]

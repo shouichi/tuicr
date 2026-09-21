@@ -178,6 +178,7 @@ impl GhPullRequestDetails {
             closed: self.closed,
             merged_at: self.merged_at,
             diff_start_sha: None,
+            patch_sets: Default::default(),
         })
     }
 }

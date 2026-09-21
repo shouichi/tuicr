@@ -1,5 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -8,6 +11,10 @@ use crate::model::{DiffFile, FilePatch};
 
 /// Apply `.tuicrignore` rules from the repository root to a diff file set.
 pub fn filter_diff_files(repo_root: &Path, diff_files: Vec<DiffFile>) -> Vec<DiffFile> {
+    record_generated(
+        repo_root,
+        diff_files.iter().map(|f| f.display_path().as_path()),
+    );
     let mut matcher = Matcher::new(repo_root);
     diff_files
         .into_iter()
@@ -20,6 +27,7 @@ pub fn filter_diff_files(repo_root: &Path, diff_files: Vec<DiffFile>) -> Vec<Dif
 /// the syntax-highlighting cost (a large minified bundle otherwise stalls
 /// PR open even though it is excluded from the review).
 pub fn filter_file_patches(repo_root: &Path, patches: Vec<FilePatch>) -> Vec<FilePatch> {
+    record_generated(repo_root, patches.iter().filter_map(|p| p.display_path()));
     let mut matcher = Matcher::new(repo_root);
     patches
         .into_iter()
@@ -116,6 +124,71 @@ impl<'a> Matcher<'a> {
         }
         false
     }
+}
+
+/// Diff paths last seen with `linguist-generated` set. Every diff passes
+/// through the filters above before its files reach the review session,
+/// which marks these reviewed when it first sees them.
+static GENERATED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+pub fn is_generated(path: &Path) -> bool {
+    GENERATED.lock().is_ok_and(|g| g.contains(path))
+}
+
+fn record_generated<'p>(repo_root: &Path, paths: impl IntoIterator<Item = &'p Path>) {
+    let paths: Vec<&Path> = paths.into_iter().collect();
+    let generated = generated(repo_root, paths.iter().copied());
+    if let Ok(mut recorded) = GENERATED.lock() {
+        for path in paths {
+            if generated.contains(path) {
+                recorded.insert(path.to_path_buf());
+            } else {
+                recorded.remove(path);
+            }
+        }
+    }
+}
+
+/// Paths whose `linguist-generated` attribute is set, the way GitHub
+/// collapses them in a PR diff:
+/// https://github.com/github-linguist/linguist/blob/main/docs/overrides.md#generated-code
+fn generated<'p>(repo_root: &Path, paths: impl IntoIterator<Item = &'p Path>) -> HashSet<PathBuf> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        input.push(0);
+    }
+    if input.is_empty() {
+        return HashSet::new();
+    }
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+    // git answers as it reads, so feeding it from this thread could block
+    // on a full stdout pipe.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output();
+    let _ = writer.join();
+    let Some(output) = output.ok().filter(|o| o.status.success()) else {
+        return HashSet::new();
+    };
+    output
+        .stdout
+        .split(|b| *b == 0)
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+        .filter(|record| matches!(record[2], b"set" | b"true"))
+        .map(|record| PathBuf::from(String::from_utf8_lossy(record[0]).into_owned()))
+        .collect()
 }
 
 fn load(root: &Path, file: &Path) -> Option<Gitignore> {
@@ -414,5 +487,66 @@ mod tests {
             .collect();
 
         assert_eq!(kept_paths, vec!["src/lib.rs"]);
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempdir().expect("failed to create temp dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .expect("failed to run git init");
+        assert!(status.success());
+        dir
+    }
+
+    #[test]
+    fn records_linguist_generated_files() {
+        let dir = git_repo();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.pb.go linguist-generated\ngen/** linguist-generated=true\ngen/keep.rs -linguist-generated\n",
+        )
+        .expect("failed to write .gitattributes");
+
+        let files = vec![
+            make_diff_file("api/gen_test.pb.go"),
+            make_diff_file("gen/gen_test.rs"),
+            make_diff_file("gen/keep.rs"),
+            make_diff_file("src/gen_test.rs"),
+        ];
+
+        assert_eq!(filter_diff_files(dir.path(), files).len(), 4);
+        assert!(is_generated(Path::new("api/gen_test.pb.go")));
+        assert!(is_generated(Path::new("gen/gen_test.rs")));
+        assert!(!is_generated(Path::new("gen/keep.rs")));
+        assert!(!is_generated(Path::new("src/gen_test.rs")));
+    }
+
+    #[test]
+    fn session_marks_generated_files_reviewed_once() {
+        let dir = git_repo();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.gen.rs linguist-generated\n",
+        )
+        .expect("failed to write .gitattributes");
+        let generated = make_diff_file("src/session_test.gen.rs");
+        let path = generated.display_path().clone();
+        let files = filter_diff_files(dir.path(), vec![generated]);
+
+        let mut session = crate::model::ReviewSession::new(
+            dir.path().to_path_buf(),
+            "HEAD".to_string(),
+            None,
+            crate::model::SessionDiffSource::WorkingTree,
+        );
+        session.add_diff_file(&files[0]);
+        assert!(session.is_file_reviewed(&path));
+
+        session.get_file_mut(&path).unwrap().reviewed = false;
+        session.add_diff_file(&files[0]);
+        assert!(!session.is_file_reviewed(&path));
     }
 }

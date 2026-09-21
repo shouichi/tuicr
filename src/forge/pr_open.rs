@@ -236,6 +236,7 @@ mod tests {
             closed: false,
             merged_at: None,
             diff_start_sha: None,
+            patch_sets: Default::default(),
         }
     }
 

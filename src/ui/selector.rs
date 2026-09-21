@@ -792,6 +792,32 @@ mod selector_render_snapshot_tests {
     const TAB_STRIP_ROW: u16 = 0;
 
     #[test]
+    fn inline_selector_keeps_cycled_commit_visible() {
+        for order in [
+            crate::app::CommitOrder::Descending,
+            crate::app::CommitOrder::Ascending,
+        ] {
+            let mut app = make_app((0..10).map(commit).collect());
+            app.review_commits = app.commit_list.clone();
+            app.commit_order = order;
+            app.commit_selection_range = Some((0, 0));
+            app.commit_list_cursor = 0;
+            draw_inline_at(&mut app, 120);
+
+            for _ in 0..6 {
+                app.cycle_commit_next();
+                let buffer = draw_inline_at(&mut app, 120);
+
+                let hash = format!("abc{}", app.commit_list_cursor);
+                assert!(
+                    (0..buffer.area.height).any(|y| row_text(&buffer, y).contains(&hash)),
+                    "{order:?}: {hash} is scrolled out of view"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn should_resize_branch_columns_on_fullscreen_and_inline_selectors() {
         // given
         let mut wide_commit = commit(0);

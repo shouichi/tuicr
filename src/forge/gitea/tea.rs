@@ -1111,6 +1111,7 @@ fn into_details(pr: GiteaPullRequest, repository: &ForgeRepository) -> PullReque
         closed,
         merged_at: pr.merged_at,
         diff_start_sha: None,
+        patch_sets: Default::default(),
     }
 }
 

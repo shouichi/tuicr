@@ -29,6 +29,7 @@ fn sample_pr_info() -> PullRequestInfo {
             closed: false,
             merged_at: None,
             diff_start_sha: None,
+            patch_sets: Default::default(),
         },
         review_decision: Some("REVIEW_REQUIRED".to_string()),
         mergeable: Some("MERGEABLE".to_string()),
@@ -69,6 +70,7 @@ fn build_pr_app() -> App {
         state: "OPEN".to_string(),
         closed: false,
         merged: false,
+        patch_sets: Default::default(),
     };
     let vcs_info = VcsInfo {
         root_path: PathBuf::from("forge:github.com/owner/repo"),

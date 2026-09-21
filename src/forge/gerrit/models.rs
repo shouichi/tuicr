@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::forge::remote_comments::{RemoteCommentSide, RemoteReviewComment, RemoteReviewThread};
 use crate::forge::traits::{
-    ForgeRepository, PullRequestCommit, PullRequestDetails, PullRequestSummary,
+    ForgeRepository, PatchSetRange, PullRequestCommit, PullRequestDetails, PullRequestSummary,
 };
 
 /// Gerrit's timestamp format: UTC, space-separated, nanosecond precision.
@@ -125,11 +125,31 @@ impl GerritChange {
         self.revisions.get(sha).map(|revision| (sha, revision))
     }
 
-    /// The patch set ref (`refs/changes/65/3965/2`) of the current revision.
+    /// The revision of `patch_set`, or the current one for `None`. Patch sets
+    /// other than the current one are only present with `ALL_REVISIONS`.
+    fn revision(&self, patch_set: Option<u32>) -> Option<(&String, &GerritRevision)> {
+        match patch_set {
+            None => self.current(),
+            Some(number) => self
+                .revisions
+                .iter()
+                .find(|(_, revision)| revision.number == u64::from(number)),
+        }
+    }
+
+    /// The first patch set in `patch_sets` this change does not have.
+    pub fn missing_patch_set(&self, patch_sets: PatchSetRange) -> Option<u32> {
+        [patch_sets.base, patch_sets.head]
+            .into_iter()
+            .flatten()
+            .find(|number| self.revision(Some(*number)).is_none())
+    }
+
+    /// The patch set ref (`refs/changes/65/3965/2`) of the head revision.
     /// Falls back to the change's own ref shape when revisions were not
     /// requested.
-    fn head_ref(&self) -> String {
-        self.current()
+    fn head_ref(&self, head: Option<u32>) -> String {
+        self.revision(head)
             .map(|(_, revision)| revision.ref_name.clone())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| format!("refs/changes/{:02}/{}", self.number % 100, self.number))
@@ -155,7 +175,7 @@ impl GerritChange {
     pub fn into_summary(self, repo: &ForgeRepository, web_base: &str) -> PullRequestSummary {
         let url = self.web_url(web_base);
         let author = self.author_handle();
-        let head_ref_name = self.head_ref();
+        let head_ref_name = self.head_ref(None);
         PullRequestSummary {
             repository: repo.clone(),
             number: self.number,
@@ -170,11 +190,16 @@ impl GerritChange {
         }
     }
 
-    pub fn into_details(self, repo: &ForgeRepository, web_base: &str) -> PullRequestDetails {
+    pub fn into_details(
+        self,
+        repo: &ForgeRepository,
+        web_base: &str,
+        patch_sets: PatchSetRange,
+    ) -> PullRequestDetails {
         let url = self.web_url(web_base);
         let author = self.author_handle();
-        let head_ref_name = self.head_ref();
-        let (head_sha, base_sha, body) = match self.current() {
+        let head_ref_name = self.head_ref(patch_sets.head);
+        let (head_sha, parent_sha, body) = match self.revision(patch_sets.head) {
             Some((sha, revision)) => {
                 let commit = revision.commit.as_ref();
                 let base = commit
@@ -188,6 +213,10 @@ impl GerritChange {
             }
             None => (String::new(), String::new(), String::new()),
         };
+        let base_sha = patch_sets
+            .base
+            .and_then(|number| self.revision(Some(number)))
+            .map_or(parent_sha, |(sha, _)| sha.clone());
         let status = self.status.to_ascii_uppercase();
         let merged_at = (status == "MERGED").then(|| at(&self.submitted)).flatten();
         PullRequestDetails {
@@ -207,16 +236,17 @@ impl GerritChange {
             closed: status == "ABANDONED",
             merged_at,
             diff_start_sha: None,
+            patch_sets,
         }
     }
 
-    /// The current revision as the change's single commit. Gerrit changes are
+    /// The head revision as the change's single commit. Gerrit changes are
     /// one commit per patch set, so this list never has more than one entry.
-    pub fn into_commits(self) -> Vec<PullRequestCommit> {
+    pub fn into_commits(self, head: Option<u32>) -> Vec<PullRequestCommit> {
         let author = self.author_handle().unwrap_or_default();
         let timestamp = at(&self.updated);
         let summary = self.subject.clone();
-        match self.current() {
+        match self.revision(head) {
             Some((sha, _)) => vec![PullRequestCommit {
                 oid: sha.clone(),
                 short_oid: sha.chars().take(8).collect(),
@@ -279,6 +309,25 @@ impl GerritComment {
         }
     }
 
+    /// The side of the `base..head` diff this comment's line is on, or `None`
+    /// when it was left on a file version that diff does not show. Comparing
+    /// two patch sets puts the base patch set's own lines on the left, where
+    /// the parent's would otherwise be.
+    fn placement(&self, head: u32, base: Option<u32>) -> Option<RemoteCommentSide> {
+        let side = self.side();
+        if self.patch_set == 0 {
+            return Some(side);
+        }
+        match (side, base) {
+            (RemoteCommentSide::Right, _) if self.patch_set == head => Some(side),
+            (RemoteCommentSide::Left, None) if self.patch_set == head => Some(side),
+            (RemoteCommentSide::Right, Some(base)) if self.patch_set == base => {
+                Some(RemoteCommentSide::Left)
+            }
+            _ => None,
+        }
+    }
+
     /// `change_url` is the change's web URL; Gerrit comment permalinks hang
     /// off it as `<change-url>/comment/<uuid>/`.
     fn into_remote(self, change_url: &str) -> RemoteReviewComment {
@@ -304,12 +353,14 @@ const MAGIC_PATHS: &[&str] = &["/COMMIT_MSG", "/MERGE_LIST", "/PATCHSET_LEVEL"];
 /// Gerrit models a discussion as a chain of `in_reply_to` links rather than an
 /// explicit thread object, so each root comment (one with no parent, or whose
 /// parent is missing from this response) opens a thread and every descendant
-/// joins it. `current_patch_set` marks threads left on an older patch set as
-/// outdated, matching what the Gerrit web UI shows.
+/// joins it. Threads left on a file version outside the `base_patch_set..
+/// head_patch_set` diff are marked outdated, matching what the Gerrit web UI
+/// shows.
 pub fn threads_from_comment_map(
     comments: BTreeMap<String, Vec<GerritComment>>,
     change_url: &str,
-    current_patch_set: u32,
+    head_patch_set: u32,
+    base_patch_set: Option<u32>,
 ) -> Vec<RemoteReviewThread> {
     let mut threads: Vec<RemoteReviewThread> = Vec::new();
     for (path, mut file_comments) in comments {
@@ -339,14 +390,14 @@ pub fn threads_from_comment_map(
                 }
                 None => {
                     thread_of.insert(id.clone(), threads.len());
+                    let placement = comment.placement(head_patch_set, base_patch_set);
                     threads.push(RemoteReviewThread {
                         id,
                         path: path.clone(),
                         line: comment.line,
-                        side: comment.side(),
+                        side: placement.unwrap_or_else(|| comment.side()),
                         is_resolved: !comment.unresolved,
-                        is_outdated: comment.patch_set != 0
-                            && comment.patch_set != current_patch_set,
+                        is_outdated: placement.is_none(),
                         // Moves `comment`, so it comes last.
                         comments: vec![comment.into_remote(change_url)],
                     });
@@ -408,7 +459,11 @@ mod tests {
         // given
         let change: GerritChange = serde_json::from_str(change_json()).expect("parse");
         // when
-        let details = change.into_details(&gerrit_repo(), "https://gerrit.example.com");
+        let details = change.into_details(
+            &gerrit_repo(),
+            "https://gerrit.example.com",
+            PatchSetRange::default(),
+        );
         // then
         assert_eq!(details.number, 3965);
         assert_eq!(details.state, "OPEN");
@@ -436,8 +491,16 @@ mod tests {
         // when
         let merged: GerritChange = serde_json::from_str(&merged).expect("parse");
         let abandoned: GerritChange = serde_json::from_str(&abandoned).expect("parse");
-        let merged = merged.into_details(&gerrit_repo(), "https://gerrit.example.com");
-        let abandoned = abandoned.into_details(&gerrit_repo(), "https://gerrit.example.com");
+        let merged = merged.into_details(
+            &gerrit_repo(),
+            "https://gerrit.example.com",
+            PatchSetRange::default(),
+        );
+        let abandoned = abandoned.into_details(
+            &gerrit_repo(),
+            "https://gerrit.example.com",
+            PatchSetRange::default(),
+        );
         // then
         assert_eq!(merged.state, "MERGED");
         assert_eq!(merged.read_only_reason(), Some("merged"));
@@ -450,7 +513,7 @@ mod tests {
         // given
         let change: GerritChange = serde_json::from_str(change_json()).expect("parse");
         // when
-        let commits = change.into_commits();
+        let commits = change.into_commits(None);
         // then
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].short_oid, "674ac754");
@@ -471,7 +534,7 @@ mod tests {
         let comments: BTreeMap<String, Vec<GerritComment>> =
             serde_json::from_str(json).expect("parse");
         // when
-        let threads = threads_from_comment_map(comments, "https://gerrit.example.com", 2);
+        let threads = threads_from_comment_map(comments, "https://gerrit.example.com", 2, None);
         // then — dropping it instead would lose the comment entirely
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "orphan");
@@ -502,6 +565,7 @@ mod tests {
             comments,
             "https://gerrit.example.com/c/platform/base/+/3965",
             2,
+            None,
         );
         // then — the magic path is dropped and the reply joins its root
         assert_eq!(threads.len(), 2);
@@ -516,6 +580,37 @@ mod tests {
         assert!(
             threads[1].is_outdated,
             "patch set 1 is behind the current 2"
+        );
+    }
+
+    #[test]
+    fn should_place_the_base_patch_sets_comments_on_the_left_when_comparing() {
+        // given
+        let json = r#"{
+            "src/main.rs": [
+                {"id": "head", "line": 1, "message": "a", "patch_set": 3},
+                {"id": "base", "line": 2, "message": "b", "patch_set": 2},
+                {"id": "parent", "line": 3, "message": "c", "patch_set": 3, "side": "PARENT"},
+                {"id": "older", "line": 4, "message": "d", "patch_set": 1}
+            ]
+        }"#;
+        let comments: BTreeMap<String, Vec<GerritComment>> =
+            serde_json::from_str(json).expect("parse");
+        // when
+        let threads = threads_from_comment_map(comments, "https://gerrit.example.com", 3, Some(2));
+        // then
+        let placed: Vec<_> = threads
+            .iter()
+            .map(|t| (t.id.as_str(), t.side, t.is_outdated))
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                ("head", RemoteCommentSide::Right, false),
+                ("base", RemoteCommentSide::Left, false),
+                ("parent", RemoteCommentSide::Left, true),
+                ("older", RemoteCommentSide::Right, true),
+            ]
         );
     }
 }
