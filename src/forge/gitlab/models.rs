@@ -154,6 +154,7 @@ impl GlabMrDetails {
             closed,
             merged_at: self.merged_at,
             diff_start_sha,
+            patch_sets: Default::default(),
         })
     }
 }

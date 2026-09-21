@@ -451,6 +451,7 @@ mod tests {
                 closed: false,
                 merged_at: None,
                 diff_start_sha: None,
+                patch_sets: Default::default(),
             },
             review_decision: Some("REVIEW_REQUIRED".to_string()),
             mergeable: Some("MERGEABLE".to_string()),

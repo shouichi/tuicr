@@ -21,6 +21,45 @@ use crate::vcs::{
     BATCH_BOUNDARY, apply_container_full_file_highlight, parse_batched_files, slice_context_lines,
 };
 
+/// Fields are separated by \x00 and records by \x01. Bookmark names are
+/// separated by \x02 because git ref names may contain commas.
+const COMMIT_INFO_TEMPLATE: &str = r#"commit_id ++ "\x00" ++ commit_id.short() ++ "\x00" ++ description ++ "\x00" ++ author.email() ++ "\x00" ++ committer.timestamp() ++ "\x00" ++ local_bookmarks.map(|b| b.name()).join("\x02") ++ "\x01""#;
+
+fn parse_commit_infos(output: &str) -> impl Iterator<Item = CommitInfo> + '_ {
+    output.split('\x01').filter_map(|record| {
+        let record = record.trim();
+        if record.is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = record.split('\x00').collect();
+        if parts.len() < 6 {
+            return None;
+        }
+
+        let (summary, body) = parse_description(parts[2]);
+        // jj timestamp format is ISO 8601: "2024-01-15T10:30:00.000-05:00"
+        let time = DateTime::parse_from_rfc3339(parts[4])
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        // Same as the git backend: the first local bookmark in name order.
+        let branch_name = parts[5]
+            .split('\x02')
+            .filter(|name| !name.is_empty())
+            .min()
+            .map(str::to_string);
+
+        Some(CommitInfo {
+            id: parts[0].to_string(),
+            short_id: parts[1].to_string(),
+            branch_name,
+            summary,
+            body,
+            author: parts[3].to_string(),
+            time,
+        })
+    })
+}
+
 /// Parse a jj description into (summary, optional body).
 fn parse_description(desc: &str) -> (String, Option<String>) {
     if desc.trim().is_empty() {
@@ -324,14 +363,9 @@ impl VcsBackend for JjBackend {
     }
 
     fn get_recent_commits(&self, offset: usize, limit: usize) -> Result<Vec<CommitInfo>> {
-        // Use jj log with a template to get structured output
-        // Template fields separated by \x00, records separated by \x01
-        // Note: jj uses change_id for identifying changes, commit_id for the underlying git commit
-        //
         // jj log doesn't have a --skip option, so we fetch offset+limit commits
         // and skip the first `offset` in Rust code
         let fetch_count = offset + limit;
-        let template = r#"commit_id ++ "\x00" ++ commit_id.short() ++ "\x00" ++ description ++ "\x00" ++ author.email() ++ "\x00" ++ committer.timestamp() ++ "\x01""#;
         let output = run_jj_command(
             &self.info.root_path,
             [
@@ -342,44 +376,11 @@ impl VcsBackend for JjBackend {
                 &fetch_count.to_string(),
                 "--no-graph",
                 "-T",
-                template,
+                COMMIT_INFO_TEMPLATE,
             ],
         )?;
 
-        let mut commits = Vec::new();
-        for record in output.split('\x01') {
-            let record = record.trim();
-            if record.is_empty() {
-                continue;
-            }
-
-            let parts: Vec<&str> = record.split('\x00').collect();
-            if parts.len() < 5 {
-                continue;
-            }
-
-            let id = parts[0].to_string();
-            let short_id = parts[1].to_string();
-            let (summary, body) = parse_description(parts[2]);
-            let author = parts[3].to_string();
-
-            // jj timestamp format is ISO 8601: "2024-01-15T10:30:00.000-05:00"
-            let time = DateTime::parse_from_rfc3339(parts[4])
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-
-            commits.push(CommitInfo {
-                id,
-                short_id,
-                branch_name: None,
-                summary,
-                body,
-                author,
-                time,
-            });
-        }
-
-        Ok(commits.into_iter().skip(offset).collect())
+        Ok(parse_commit_infos(&output).skip(offset).collect())
     }
 
     fn get_commit_range_diff(
@@ -425,48 +426,26 @@ impl VcsBackend for JjBackend {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Use jj log with a revset matching the given IDs
         let revset = ids
             .iter()
             .map(|id| id.as_str())
             .collect::<Vec<_>>()
             .join(" | ");
-        let template = r#"commit_id ++ "\x00" ++ commit_id.short() ++ "\x00" ++ description ++ "\x00" ++ author.email() ++ "\x00" ++ committer.timestamp() ++ "\x01""#;
         let output = run_jj_command(
             &self.info.root_path,
-            ["log", "-r", &revset, "--no-graph", "-T", template],
+            [
+                "log",
+                "-r",
+                &revset,
+                "--no-graph",
+                "-T",
+                COMMIT_INFO_TEMPLATE,
+            ],
         )?;
 
-        let mut by_id: HashMap<String, CommitInfo> = HashMap::new();
-        for record in output.split('\x01') {
-            let record = record.trim();
-            if record.is_empty() {
-                continue;
-            }
-            let parts: Vec<&str> = record.split('\x00').collect();
-            if parts.len() < 5 {
-                continue;
-            }
-            let id = parts[0].to_string();
-            let short_id = parts[1].to_string();
-            let (summary, body) = parse_description(parts[2]);
-            let author = parts[3].to_string();
-            let time = DateTime::parse_from_rfc3339(parts[4])
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
-            by_id.insert(
-                id.clone(),
-                CommitInfo {
-                    id,
-                    short_id,
-                    branch_name: None,
-                    summary,
-                    body,
-                    author,
-                    time,
-                },
-            );
-        }
+        let mut by_id: HashMap<String, CommitInfo> = parse_commit_infos(&output)
+            .map(|commit| (commit.id.clone(), commit))
+            .collect();
 
         // Return in input order
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
@@ -1647,6 +1626,45 @@ mod tests {
             Some("main"),
             "Expected ancestor bookmark 'main' to be detected"
         );
+    }
+
+    #[test]
+    fn test_jj_commits_carry_first_local_bookmark() {
+        let Some(temp) = setup_test_repo_with_bookmark_on_ancestor() else {
+            eprintln!("Skipping test: jj command not available");
+            return;
+        };
+        jj_cmd()
+            .args(["bookmark", "create", "zeta", "-r", "@--"])
+            .current_dir(temp.path())
+            .output()
+            .expect("Failed to create bookmark");
+
+        let backend = JjBackend::from_path(temp.path().to_path_buf(), DiffWhitespaceMode::Normal)
+            .expect("Failed to create jj backend");
+        let recent = backend
+            .get_recent_commits(0, 10)
+            .expect("Failed to get commits");
+        let ids: Vec<String> = recent.iter().map(|c| c.id.clone()).collect();
+        let info = backend
+            .get_commits_info(&ids)
+            .expect("Failed to get commits info");
+
+        for commits in [&recent, &info] {
+            let names: Vec<(&str, Option<&str>)> = commits
+                .iter()
+                .map(|c| (c.summary.as_str(), c.branch_name.as_deref()))
+                .collect();
+            assert_eq!(
+                names,
+                vec![
+                    ("(no description set)", None),
+                    ("Second commit", None),
+                    ("Initial commit", Some("main")),
+                    ("(no description set)", None),
+                ]
+            );
+        }
     }
 
     /// Create a test repo with no bookmarks.

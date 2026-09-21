@@ -438,7 +438,10 @@ fn parse_hunks(
         }
     }
 
-    Ok(hunks)
+    Ok(hunks
+        .into_iter()
+        .flat_map(DiffHunk::split_at_change_runs)
+        .collect())
 }
 
 #[cfg(test)]

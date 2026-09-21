@@ -354,6 +354,7 @@ impl App {
         let event = in_flight.event;
         let mappable = in_flight.mappable.clone();
         let commit_id = state.commit_id.clone();
+        let patch_sets = pr.patch_sets;
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
 
@@ -370,7 +371,8 @@ impl App {
                 repository.clone(),
                 pr_number,
                 pr_number.to_string(),
-            );
+            )
+            .with_patch_sets(patch_sets);
             let result = match backend.get_pull_request(target) {
                 Ok(details) => backend
                     .create_review(
