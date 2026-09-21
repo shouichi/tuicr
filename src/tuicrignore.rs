@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -8,7 +10,10 @@ use crate::model::{DiffFile, FilePatch};
 
 /// Apply `.tuicrignore` rules from the repository root to a diff file set.
 pub fn filter_diff_files(repo_root: &Path, diff_files: Vec<DiffFile>) -> Vec<DiffFile> {
-    let mut matcher = Matcher::new(repo_root);
+    let mut matcher = Matcher::new(
+        repo_root,
+        diff_files.iter().map(|f| f.display_path().as_path()),
+    );
     diff_files
         .into_iter()
         .filter(|file| !matcher.is_ignored(file.display_path()))
@@ -20,7 +25,7 @@ pub fn filter_diff_files(repo_root: &Path, diff_files: Vec<DiffFile>) -> Vec<Dif
 /// the syntax-highlighting cost (a large minified bundle otherwise stalls
 /// PR open even though it is excluded from the review).
 pub fn filter_file_patches(repo_root: &Path, patches: Vec<FilePatch>) -> Vec<FilePatch> {
-    let mut matcher = Matcher::new(repo_root);
+    let mut matcher = Matcher::new(repo_root, patches.iter().filter_map(|p| p.display_path()));
     patches
         .into_iter()
         .filter(|patch| {
@@ -35,7 +40,7 @@ pub fn filter_file_patches(repo_root: &Path, patches: Vec<FilePatch>) -> Vec<Fil
 /// list of paths. Used by the cheap status probe to verify that survives the
 /// ignore filter without paying the full-diff cost.
 pub fn filter_paths(repo_root: &Path, paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut matcher = Matcher::new(repo_root);
+    let mut matcher = Matcher::new(repo_root, paths.iter().map(PathBuf::as_path));
     paths
         .into_iter()
         .filter(|p| !matcher.is_ignored(p))
@@ -46,8 +51,9 @@ pub fn has_tuicrignore(repo_root: &Path) -> bool {
     repo_root.join(".tuicrignore").is_file()
 }
 
-/// `.tuicrignore` at the repository root decides first. Otherwise the path
-/// is walked the way git walks it: top-down, each directory checked before
+/// `.tuicrignore` at the repository root decides first. Otherwise a path
+/// `.gitattributes` marks `linguist-generated` is excluded, and the rest
+/// are walked the way git walks it: top-down, each directory checked before
 /// anything inside it, so an excluded directory hides its contents and its
 /// own `.gitignore` is never read. Each component is matched against the
 /// `.gitignore` files of its ancestors, deepest first; the first file with a
@@ -55,15 +61,17 @@ pub fn has_tuicrignore(repo_root: &Path) -> bool {
 struct Matcher<'a> {
     repo_root: &'a Path,
     tuicrignore: Option<Gitignore>,
+    generated: HashSet<PathBuf>,
     /// `.gitignore` per repo-relative directory, loaded on first use.
     gitignores: HashMap<PathBuf, Option<Gitignore>>,
 }
 
 impl<'a> Matcher<'a> {
-    fn new(repo_root: &'a Path) -> Self {
+    fn new<'p>(repo_root: &'a Path, paths: impl IntoIterator<Item = &'p Path>) -> Self {
         Self {
             repo_root,
             tuicrignore: load(repo_root, &repo_root.join(".tuicrignore")),
+            generated: generated(repo_root, paths),
             gitignores: HashMap::new(),
         }
     }
@@ -76,6 +84,9 @@ impl<'a> Matcher<'a> {
             }
         }) {
             return decided;
+        }
+        if self.generated.contains(path) {
+            return true;
         }
         // Diff paths are repo-relative; anything else (`..`, absolute) would
         // read `.gitignore` files outside the repository.
@@ -116,6 +127,48 @@ impl<'a> Matcher<'a> {
         }
         false
     }
+}
+
+/// Paths whose `linguist-generated` attribute is set, the way GitHub
+/// collapses them in a PR diff:
+/// https://github.com/github-linguist/linguist/blob/main/docs/overrides.md#generated-code
+fn generated<'p>(repo_root: &Path, paths: impl IntoIterator<Item = &'p Path>) -> HashSet<PathBuf> {
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        input.push(0);
+    }
+    if input.is_empty() {
+        return HashSet::new();
+    }
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+    // git answers as it reads, so feeding it from this thread could block
+    // on a full stdout pipe.
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child.wait_with_output();
+    let _ = writer.join();
+    let Some(output) = output.ok().filter(|o| o.status.success()) else {
+        return HashSet::new();
+    };
+    output
+        .stdout
+        .split(|b| *b == 0)
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+        .filter(|record| matches!(record[2], b"set" | b"true"))
+        .map(|record| PathBuf::from(String::from_utf8_lossy(record[0]).into_owned()))
+        .collect()
 }
 
 fn load(root: &Path, file: &Path) -> Option<Gitignore> {
@@ -414,5 +467,64 @@ mod tests {
             .collect();
 
         assert_eq!(kept_paths, vec!["src/lib.rs"]);
+    }
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempdir().expect("failed to create temp dir");
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .expect("failed to run git init");
+        assert!(status.success());
+        dir
+    }
+
+    #[test]
+    fn filters_linguist_generated_files() {
+        let dir = git_repo();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.pb.go linguist-generated\ngen/** linguist-generated=true\ngen/keep.rs -linguist-generated\n",
+        )
+        .expect("failed to write .gitattributes");
+
+        let files = vec![
+            make_diff_file("api/foo.pb.go"),
+            make_diff_file("gen/drop.rs"),
+            make_diff_file("gen/keep.rs"),
+            make_diff_file("src/main.rs"),
+        ];
+
+        let filtered = filter_diff_files(dir.path(), files);
+        let kept_paths: Vec<String> = filtered
+            .iter()
+            .map(|f| f.display_path().display().to_string())
+            .collect();
+
+        assert_eq!(kept_paths, vec!["gen/keep.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn tuicrignore_overrides_linguist_generated() {
+        let dir = git_repo();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.pb.go linguist-generated\n",
+        )
+        .expect("failed to write .gitattributes");
+        fs::write(dir.path().join(".tuicrignore"), "!api/keep.pb.go\n")
+            .expect("failed to write .tuicrignore");
+
+        let paths = vec![
+            PathBuf::from("api/drop.pb.go"),
+            PathBuf::from("api/keep.pb.go"),
+        ];
+
+        assert_eq!(
+            filter_paths(dir.path(), paths),
+            vec![PathBuf::from("api/keep.pb.go")]
+        );
     }
 }
