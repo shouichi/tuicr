@@ -325,10 +325,15 @@ impl App {
             return;
         };
 
+        let undo = self.review_undo_snapshot();
         self.revealed_reviewed_file = None;
         if let Some(review) = self.session.get_file_mut(&path) {
             review.reviewed = !review.reviewed;
+            let reviewed = review.reviewed;
             self.dirty = true;
+            if reviewed {
+                self.push_review_undo(undo, ReviewUndoTarget::File(path.clone()));
+            }
 
             // Update current_file_idx before rebuilding annotations:
             // single-file view filters annotations against it.
@@ -351,9 +356,101 @@ impl App {
             if adjust_cursor {
                 let header_line = self.calculate_file_scroll_offset(file_idx);
                 self.diff_state.cursor_line = header_line;
+                if reviewed {
+                    self.advance_to_next_file();
+                }
                 self.ensure_cursor_visible();
+            } else if reviewed {
+                self.select_next_file_in_tree(file_idx);
             }
         }
+    }
+
+    /// Moves the tree selection to the first visible file after `file_idx`,
+    /// leaving it where it is when nothing follows.
+    fn select_next_file_in_tree(&mut self, file_idx: usize) {
+        let next = self
+            .build_visible_items()
+            .into_iter()
+            .find_map(|item| match item {
+                FileTreeItem::File { file_idx: idx, .. } if idx > file_idx => Some(idx),
+                _ => None,
+            });
+        if let Some(idx) = next
+            && let Some(tree_idx) = self.file_idx_to_tree_idx(idx)
+        {
+            self.file_list_state.select(tree_idx);
+        }
+    }
+
+    fn review_undo_snapshot(&self) -> ReviewUndo {
+        ReviewUndo {
+            // Overwritten by `push_review_undo`; only the view state matters
+            // at capture time, before the mark moves the cursor.
+            target: ReviewUndoTarget::File(PathBuf::new()),
+            current_file_idx: self.diff_state.current_file_idx,
+            cursor_line: self.diff_state.cursor_line,
+            scroll_offset: self.diff_state.scroll_offset,
+            tree_idx: self.file_list_state.selected(),
+        }
+    }
+
+    fn push_review_undo(&mut self, snapshot: ReviewUndo, target: ReviewUndoTarget) {
+        self.review_undo.push(ReviewUndo { target, ..snapshot });
+    }
+
+    /// Takes back the most recent `r`/`R` mark and returns the view to where
+    /// that mark was made from.
+    pub fn undo_last_review(&mut self) {
+        let Some(undo) = self.review_undo.pop() else {
+            self.set_warning("Nothing to undo");
+            return;
+        };
+
+        let message = match &undo.target {
+            ReviewUndoTarget::File(path) => {
+                let Some(review) = self.session.get_file_mut(path) else {
+                    self.set_warning("Undo target is no longer in the diff");
+                    return;
+                };
+                review.reviewed = false;
+                format!("Unmarked {}", path.display())
+            }
+            ReviewUndoTarget::Hunk {
+                path,
+                key,
+                file_auto_marked,
+            } => {
+                let Some(review) = self.session.get_file_mut(path) else {
+                    self.set_warning("Undo target is no longer in the diff");
+                    return;
+                };
+                review.reviewed_hunks.remove(key);
+                if *file_auto_marked {
+                    review.reviewed = false;
+                }
+                format!("Unmarked a hunk in {}", path.display())
+            }
+        };
+
+        self.dirty = true;
+        self.revealed_reviewed_file = None;
+        self.revealed_reviewed_hunk = None;
+        self.rebuild_annotations();
+        self.diff_state.current_file_idx = undo.current_file_idx;
+        self.diff_state.cursor_line = undo.cursor_line.min(self.max_cursor_line());
+        self.diff_state.scroll_offset = undo.scroll_offset.min(self.max_scroll_offset());
+        self.file_list_state.select(undo.tree_idx);
+        self.ensure_cursor_visible();
+        self.set_message(message);
+    }
+
+    /// Where a finished file leaves the cursor: the next file's first change,
+    /// with its name row still on screen, so holding `r` walks the review
+    /// from change to change.
+    fn advance_to_next_file(&mut self) {
+        self.next_file();
+        self.park_cursor_on_first_hunk();
     }
 
     /// Land somewhere sensible after marking `file_idx` reviewed hid it: the
@@ -368,7 +465,11 @@ impl App {
             .copied();
 
         match target {
-            Some(idx) => self.jump_to_file(idx),
+            Some(idx) => {
+                self.jump_to_file(idx);
+                self.park_cursor_on_file_header();
+                self.park_cursor_on_first_hunk();
+            }
             None => {
                 // Nothing left to review. Park at the overview so the diff
                 // pane shows its empty state rather than a stale offset, and
@@ -393,6 +494,24 @@ impl App {
             } => Some((*file_idx, *hunk_idx)),
             _ => None,
         }
+    }
+
+    /// The first hunk at or below the cursor, so a mark made from a file name
+    /// row (or any other decoration) takes the hunk it is sitting above.
+    fn first_hunk_below_cursor(&self) -> Option<(usize, usize)> {
+        self.line_annotations
+            .iter()
+            .skip(self.diff_state.cursor_line)
+            .find_map(|line| match line {
+                AnnotatedLine::HunkHeader { file_idx, hunk_idx }
+                | AnnotatedLine::DiffLine {
+                    file_idx, hunk_idx, ..
+                }
+                | AnnotatedLine::SideBySideLine {
+                    file_idx, hunk_idx, ..
+                } => Some((*file_idx, *hunk_idx)),
+                _ => None,
+            })
     }
 
     fn hunk_review_target(&self, file_idx: usize, hunk_idx: usize) -> Option<(PathBuf, String)> {
@@ -480,8 +599,12 @@ impl App {
     }
 
     pub fn toggle_hunk_reviewed(&mut self) {
-        let Some((file_idx, hunk_idx)) = self.hunk_at_cursor() else {
-            self.set_warning("Move cursor to a hunk to toggle reviewed");
+        let undo = self.review_undo_snapshot();
+        let Some((file_idx, hunk_idx)) = self
+            .hunk_at_cursor()
+            .or_else(|| self.first_hunk_below_cursor())
+        else {
+            self.set_warning("No hunk left to mark reviewed");
             return;
         };
         self.revealed_reviewed_hunk = None;
@@ -495,15 +618,49 @@ impl App {
             return;
         };
 
-        let reviewed = review.toggle_hunk_reviewed(key);
+        let reviewed = review.toggle_hunk_reviewed(key.clone());
         self.dirty = true;
+
+        // Nothing is left to read in a file whose every hunk is marked, so
+        // the file-level flag follows the hunks up and the review moves on.
+        let file_auto_marked = reviewed && self.mark_file_reviewed_if_hunks_done(file_idx, &path);
+
+        if reviewed {
+            self.push_review_undo(
+                undo,
+                ReviewUndoTarget::Hunk {
+                    path: path.clone(),
+                    key,
+                    file_auto_marked,
+                },
+            );
+        }
+        if file_auto_marked {
+            self.revealed_reviewed_file = None;
+        }
         self.rebuild_annotations();
         self.diff_state.current_file_idx = file_idx;
         if let Some(tree_idx) = self.file_idx_to_tree_idx(file_idx) {
             self.file_list_state.select(tree_idx);
         }
+
+        if file_auto_marked {
+            if self.file_idx_passes_filter(file_idx) {
+                self.diff_state.cursor_line = self.calculate_file_scroll_offset(file_idx);
+                self.advance_to_next_file();
+                self.ensure_cursor_visible();
+            } else {
+                self.advance_past_hidden_file(file_idx);
+            }
+            self.set_message("All hunks reviewed \u{00b7} file marked reviewed");
+            return;
+        }
+
         if let Some(header_line) = self.hunk_header_line(file_idx, hunk_idx) {
             self.diff_state.cursor_line = header_line;
+        }
+        if reviewed {
+            self.next_hunk();
         }
         self.ensure_cursor_visible();
 
@@ -512,6 +669,29 @@ impl App {
         } else {
             self.set_message("Hunk marked unreviewed");
         }
+    }
+
+    /// Marks `file_idx` reviewed once every one of its hunks is. Returns
+    /// whether this call was the one that flipped it.
+    fn mark_file_reviewed_if_hunks_done(&mut self, file_idx: usize, path: &PathBuf) -> bool {
+        let Some(keys) = self
+            .diff_files
+            .get(file_idx)
+            .map(|file| file.hunk_review_keys())
+        else {
+            return false;
+        };
+        if keys.is_empty() {
+            return false;
+        }
+        let Some(review) = self.session.get_file_mut(path) else {
+            return false;
+        };
+        if review.reviewed || !keys.iter().all(|key| review.reviewed_hunks.contains(key)) {
+            return false;
+        }
+        review.reviewed = true;
+        true
     }
 
     /// Files in the review population: everything surviving the `i`/`e`

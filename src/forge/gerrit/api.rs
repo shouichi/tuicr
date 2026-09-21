@@ -55,6 +55,10 @@ const USER_ENV_VAR: &str = "GERRIT_USERNAME";
 /// Gerrit HTTP password (Settings → HTTP Credentials), not the account
 /// password.
 const PASSWORD_ENV_VAR: &str = "GERRIT_PASSWORD";
+/// PEM certificate chain and private key presented when the server asks for a
+/// client certificate (mutual TLS). Set both or neither.
+const CLIENT_CERT_ENV_VAR: &str = "GERRIT_CLIENT_CERT";
+const CLIENT_KEY_ENV_VAR: &str = "GERRIT_CLIENT_KEY";
 /// Label a review vote is cast on. `Code-Review` is Gerrit's out-of-the-box
 /// review label and is present on every default install.
 const REVIEW_LABEL: &str = "Code-Review";
@@ -88,25 +92,38 @@ pub trait GerritHttp: Send + Sync {
     fn is_authenticated(&self) -> bool;
 }
 
-/// Direct REST transport, optionally with HTTP Basic credentials.
+/// Direct REST transport, optionally with HTTP Basic credentials and a client
+/// certificate. Server certificates are verified against the OS trust store, so
+/// a private CA trusted there works.
 pub struct HttpsGerrit {
     auth_header: Option<String>,
-    agent: ureq::Agent,
+    /// `Err` when a configured client certificate could not be loaded; every
+    /// request then fails with that message.
+    agent: std::result::Result<ureq::Agent, String>,
 }
 
 impl HttpsGerrit {
-    pub fn new(credentials: Option<(String, String)>) -> Self {
+    pub fn new(
+        credentials: Option<(String, String)>,
+        client_cert: std::result::Result<Option<ureq::tls::ClientCert>, String>,
+    ) -> Self {
         let auth_header = credentials.map(|(user, password)| {
             format!("Basic {}", BASE64.encode(format!("{user}:{password}")))
         });
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build();
-        Self {
-            auth_header,
-            agent: config.into(),
-        }
+        let agent = client_cert.map(|client_cert| {
+            ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                        .client_cert(client_cert)
+                        .build(),
+                )
+                .build()
+                .into()
+        });
+        Self { auth_header, agent }
     }
 
     /// Refuse to put the HTTP Basic header on a plaintext request.
@@ -153,14 +170,21 @@ impl GerritHttp for HttpsGerrit {
 
     fn request(&self, method: &str, url: &str, body: Option<&str>) -> GerritHttpResult<String> {
         self.reject_plaintext_credentials(url)?;
+        let agent = self
+            .agent
+            .as_ref()
+            .map_err(|body| GerritHttpError::Failed {
+                status: None,
+                body: body.clone(),
+            })?;
         // `ureq` gives with-body and without-body builders different types, so
         // the body-carrying methods share one arm and GET gets its own.
         let result = match method.to_ascii_uppercase().as_str() {
-            "GET" => self.authorized(self.agent.get(url)).call(),
+            "GET" => self.authorized(agent.get(url)).call(),
             verb @ ("POST" | "PUT") => {
                 let builder = match verb {
-                    "POST" => self.agent.post(url),
-                    _ => self.agent.put(url),
+                    "POST" => agent.post(url),
+                    _ => agent.put(url),
                 };
                 self.authorized(builder)
                     .header("Content-Type", "application/json")
@@ -206,6 +230,40 @@ fn credentials_from_env() -> Option<(String, String)> {
     let user = non_empty_env(USER_ENV_VAR)?;
     let password = non_empty_env(PASSWORD_ENV_VAR)?;
     Some((user, password))
+}
+
+/// Client certificate from the environment, when both paths are set.
+fn client_cert_from_env() -> std::result::Result<Option<ureq::tls::ClientCert>, String> {
+    match (
+        non_empty_env(CLIENT_CERT_ENV_VAR),
+        non_empty_env(CLIENT_KEY_ENV_VAR),
+    ) {
+        (None, None) => Ok(None),
+        (Some(cert), Some(key)) => load_client_cert(Path::new(&cert), Path::new(&key)).map(Some),
+        _ => Err(format!(
+            "set both {CLIENT_CERT_ENV_VAR} and {CLIENT_KEY_ENV_VAR}, or neither"
+        )),
+    }
+}
+
+fn load_client_cert(cert: &Path, key: &Path) -> std::result::Result<ureq::tls::ClientCert, String> {
+    let read = |path: &Path| {
+        std::fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+    };
+    let chain = ureq::tls::parse_pem(&read(cert)?)
+        .filter_map(|item| match item {
+            Ok(ureq::tls::PemItem::Certificate(cert)) => Some(Ok(cert)),
+            Ok(_) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| format!("cannot parse {}: {err}", cert.display()))?;
+    if chain.is_empty() {
+        return Err(format!("no certificate in {}", cert.display()));
+    }
+    let key = ureq::tls::PrivateKey::from_pem(&read(key)?)
+        .map_err(|err| format!("cannot parse {}: {err}", key.display()))?;
+    Ok(ureq::tls::ClientCert::new_with_certs(&chain, key))
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -319,7 +377,10 @@ impl GerritBackend {
     pub fn new(default_repository: Option<ForgeRepository>) -> Self {
         Self {
             default_repository,
-            http: Box::new(HttpsGerrit::new(credentials_from_env())),
+            http: Box::new(HttpsGerrit::new(
+                credentials_from_env(),
+                client_cert_from_env(),
+            )),
             local_checkout: None,
         }
     }
@@ -1626,7 +1687,7 @@ mod tests {
     #[test]
     fn should_refuse_to_send_credentials_over_plaintext_http() {
         // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
+        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())), Ok(None));
         // when — no request is made; the guard fires first
         let result = http.request(
             "GET",
@@ -1648,7 +1709,7 @@ mod tests {
     #[test]
     fn should_allow_plaintext_when_there_are_no_credentials_to_leak() {
         // given — anonymous reads over http:// stay usable
-        let http = HttpsGerrit::new(None);
+        let http = HttpsGerrit::new(None, Ok(None));
         // when
         let refused = http
             .reject_plaintext_credentials("http://review.internal/changes/")
@@ -1660,12 +1721,27 @@ mod tests {
     #[test]
     fn should_allow_credentials_over_https() {
         // given
-        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())));
+        let http = HttpsGerrit::new(Some(("jdoe".to_string(), "s3cret".to_string())), Ok(None));
         // when/then
         assert!(
             http.reject_plaintext_credentials("https://review.internal/a/changes/")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn should_fail_every_request_when_the_client_cert_cannot_load() {
+        // given
+        let missing = Path::new("/nonexistent/cert.crt");
+        let http = HttpsGerrit::new(None, load_client_cert(missing, missing).map(Some));
+        // when
+        let result = http.request("GET", "https://review.internal/changes/", None);
+        // then
+        let GerritHttpError::Failed { status, body } = result.expect_err("refused") else {
+            panic!("a broken client cert should not read as an auth failure");
+        };
+        assert_eq!(status, None);
+        assert!(body.contains("/nonexistent/cert.crt"), "{body}");
     }
 
     #[test]

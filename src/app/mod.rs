@@ -41,6 +41,22 @@ pub const GAP_EXPAND_BATCH: usize = 20;
 /// the Gitea backend (via `tea`), the Bitbucket Cloud backend (via `bkt`),
 /// the Azure DevOps backend (via `az`), or the Gerrit backend (REST, no CLI)
 /// based on `repo.kind`.
+/// Checks out a GitHub PR's branch in the local clone, returning a warning
+/// for the status bar when that fails. The review itself never depends on it.
+fn checkout_pr_branch(
+    repo: &ForgeRepository,
+    local_checkout: Option<&Path>,
+    number: u64,
+) -> Option<String> {
+    let checkout = local_checkout?;
+    if repo.kind != crate::forge::traits::ForgeKind::GitHub {
+        return None;
+    }
+    crate::forge::github::gh::checkout_pull_request(checkout, repo, number)
+        .err()
+        .map(|error| format!("gh pr checkout failed: {}", error.stderr.trim()))
+}
+
 fn create_forge_backend(
     repo: &ForgeRepository,
     local_checkout: Option<PathBuf>,
@@ -588,6 +604,28 @@ fn skip_decoration_backward(annotations: &[AnnotatedLine], start: usize) -> usiz
     line
 }
 
+/// A reviewed mark that `u` can take back, with the view state to restore.
+#[derive(Debug, Clone)]
+pub struct ReviewUndo {
+    pub target: ReviewUndoTarget,
+    pub current_file_idx: usize,
+    pub cursor_line: usize,
+    pub scroll_offset: usize,
+    pub tree_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReviewUndoTarget {
+    File(PathBuf),
+    Hunk {
+        path: PathBuf,
+        key: String,
+        /// The hunk mark completed the file, so the undo has to take the
+        /// file-level mark back with it.
+        file_auto_marked: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
@@ -840,6 +878,7 @@ pub enum PrOpenEvent {
         /// thread after this lands so `SyntaxHighlighter` does not need to
         /// cross thread boundaries.
         result: std::result::Result<crate::forge::pr_open::PrFetchData, String>,
+        checkout_warning: Option<String>,
     },
 }
 
@@ -1331,6 +1370,9 @@ pub struct App {
     /// focused file in the diff panel instead of the continuous-scroll
     /// concatenation. Toggled via `:focus` or `<leader>f`.
     pub is_single_file_view: bool,
+    /// Marks made by `r`/`R`, newest last, each with the cursor position it
+    /// was made from so `u` can put the view back where it was.
+    pub review_undo: Vec<ReviewUndo>,
     /// A reviewed file whose body is temporarily expanded after opening a
     /// comment from the summary view. The persisted reviewed marker is left
     /// untouched; this is only a presentation override for continuous view.
