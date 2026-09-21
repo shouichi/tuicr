@@ -101,6 +101,7 @@ fn make_pr_app_with_single_modified_file(file_path: &str) -> App {
         state: "OPEN".to_string(),
         closed: false,
         merged: false,
+        patch_sets: Default::default(),
     };
     let mut app = App::build(
         Box::new(DummyVcs {
@@ -1431,6 +1432,7 @@ fn should_yank_top_level_pr_comment() {
         closed: false,
         merged_at: None,
         diff_start_sha: None,
+        patch_sets: Default::default(),
     };
     let mut info = PullRequestInfo::from_details(details);
     info.issue_comments = vec![PullRequestIssueComment {

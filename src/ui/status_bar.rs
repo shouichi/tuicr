@@ -361,7 +361,7 @@ pub fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                     "   j/k move \u{00b7} \u{21b5} open \u{00b7} i/e filter \u{00b7} I/E clear \u{00b7} / search \u{00b7} r reviewed",
                 ),
                 InputMode::Normal => Cow::Borrowed(
-                    "   j/k scroll \u{00b7} {/} file \u{00b7} m/M comment \u{00b7} r file \u{00b7} R hunk \u{00b7} c comment \u{00b7} ? help",
+                    "   j/k scroll \u{00b7} {/} file \u{00b7} m/M comment \u{00b7} r hunk \u{00b7} R file \u{00b7} c comment \u{00b7} ? help",
                 ),
                 InputMode::Command => {
                     Cow::Borrowed("   tab complete \u{00b7} \u{21b5} execute \u{00b7} esc cancel")
@@ -707,6 +707,7 @@ mod header_snapshot_tests {
             state: if closed { "CLOSED" } else { "OPEN" }.to_string(),
             closed,
             merged,
+            patch_sets: Default::default(),
         }
     }
 
