@@ -325,6 +325,7 @@ impl App {
         let pr_number = current.key.number;
         let head_sha = current.key.head_sha.clone();
         let base_sha = current.base_sha.clone();
+        let patch_sets = current.patch_sets;
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
@@ -351,6 +352,7 @@ impl App {
                 closed: false,
                 merged_at: None,
                 diff_start_sha: None,
+                patch_sets,
             };
             let outcome = backend
                 .get_pull_request_commit_range_diff(&details, &start_sha, &end_sha)
@@ -489,6 +491,7 @@ impl App {
 
         let repository = current.key.repository.clone();
         let pr_number = current.key.number;
+        let patch_sets = current.patch_sets;
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
@@ -499,7 +502,8 @@ impl App {
                 show_pr_comments,
             );
             let target =
-                PullRequestTarget::with_repository(repository, pr_number, pr_number.to_string());
+                PullRequestTarget::with_repository(repository, pr_number, pr_number.to_string())
+                    .with_patch_sets(patch_sets);
             let outcome = fetch_pr_data(backend.as_ref(), target).map_err(|e| e.to_string());
             let _ = tx.send(PrReloadEvent::Done {
                 request,
@@ -667,7 +671,8 @@ impl App {
             current.key.repository.clone(),
             current.key.number,
             current.key.number.to_string(),
-        );
+        )
+        .with_patch_sets(current.patch_sets);
         let highlighter = self.theme.syntax_highlighter();
         let opened = open_pull_request(
             backend.as_ref(),
@@ -872,7 +877,7 @@ impl App {
         let Some(summary) = self.pr_tab.cursor_pr().cloned() else {
             return false;
         };
-        self.spawn_pr_open(&summary.repository, summary.number);
+        self.spawn_pr_open(&summary.repository, summary.number, Default::default());
         true
     }
 
@@ -905,14 +910,23 @@ impl App {
         if self.pr_open_state.is_some() {
             return;
         }
-        self.spawn_pr_open(&key.repository, key.number);
+        let patch_sets = crate::forge::traits::PatchSetRange {
+            base: key.base_patch_set,
+            head: None,
+        };
+        self.spawn_pr_open(&key.repository, key.number, patch_sets);
     }
 
     /// Kick off the background fetch for a PR open. The main thread keeps
     /// rendering and pumping events; the resulting `PrOpenEvent::Done` is
     /// drained in `poll_pr_open_events` where parsing happens and PR mode
     /// is entered.
-    fn spawn_pr_open(&mut self, repository: &crate::forge::traits::ForgeRepository, number: u64) {
+    fn spawn_pr_open(
+        &mut self,
+        repository: &crate::forge::traits::ForgeRepository,
+        number: u64,
+        patch_sets: crate::forge::traits::PatchSetRange,
+    ) {
         use crate::forge::pr_open::fetch_pr_data;
         use crate::forge::traits::PullRequestTarget;
 
@@ -934,6 +948,8 @@ impl App {
         let show_pr_checks = self.show_pr_checks;
         let show_pr_comments = self.show_pr_comments;
         std::thread::spawn(move || {
+            let checkout_warning =
+                checkout_pr_branch(&summary_repo, local_checkout.as_deref(), pr_number);
             let backend = create_forge_backend(
                 &summary_repo,
                 local_checkout,
@@ -941,11 +957,13 @@ impl App {
                 show_pr_comments,
             );
             let target =
-                PullRequestTarget::with_repository(summary_repo, pr_number, pr_number.to_string());
+                PullRequestTarget::with_repository(summary_repo, pr_number, pr_number.to_string())
+                    .with_patch_sets(patch_sets);
             let outcome = fetch_pr_data(backend.as_ref(), target).map_err(|e| e.to_string());
             let _ = tx.send(PrOpenEvent::Done {
                 request,
                 result: outcome,
+                checkout_warning,
             });
         });
     }
@@ -966,7 +984,11 @@ impl App {
         let in_flight = self.pr_open_state.clone();
         self.pr_open_state = None;
         match event {
-            PrOpenEvent::Done { request, result } => {
+            PrOpenEvent::Done {
+                request,
+                result,
+                checkout_warning,
+            } => {
                 // If the user cancelled (cleared pr_open_state) but the
                 // background thread sent a result before being torn down,
                 // ignore the result rather than entering PR mode.
@@ -991,6 +1013,8 @@ impl App {
                                 "Failed to open PR #{}: {}",
                                 request.pr_number, e
                             ));
+                        } else if let Some(warning) = checkout_warning {
+                            self.set_warning(warning);
                         }
                     }
                     Err(e) => {
@@ -1236,6 +1260,7 @@ impl App {
                 closed: pr.closed,
                 merged_at: None,
                 diff_start_sha: None,
+                patch_sets: pr.patch_sets,
             },
             _ => return,
         };

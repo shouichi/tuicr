@@ -1639,6 +1639,7 @@ mod remote_comments_snapshot_tests {
             state: "OPEN".to_string(),
             closed: false,
             merged: false,
+            patch_sets: Default::default(),
         };
         let vcs_info = VcsInfo {
             root_path: PathBuf::from("forge:github.com/agavra/tuicr"),

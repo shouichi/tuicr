@@ -180,6 +180,16 @@ pub struct PullRequestTarget {
     pub repository: Option<ForgeRepository>,
     pub number: u64,
     pub original: String,
+    #[serde(default)]
+    pub patch_sets: PatchSetRange,
+}
+
+/// Gerrit patch sets to diff. `base: None` diffs against the parent commit,
+/// `head: None` takes the current patch set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchSetRange {
+    pub base: Option<u32>,
+    pub head: Option<u32>,
 }
 
 impl PullRequestTarget {
@@ -188,6 +198,7 @@ impl PullRequestTarget {
             repository: None,
             number,
             original: original.into(),
+            patch_sets: PatchSetRange::default(),
         }
     }
 
@@ -200,7 +211,13 @@ impl PullRequestTarget {
             repository: Some(repository),
             number,
             original: original.into(),
+            patch_sets: PatchSetRange::default(),
         }
+    }
+
+    pub fn with_patch_sets(mut self, patch_sets: PatchSetRange) -> Self {
+        self.patch_sets = patch_sets;
+        self
     }
 }
 
@@ -296,6 +313,10 @@ pub struct PullRequestDetails {
     /// None for GitHub; populated from `diff_refs.start_sha` for GitLab.
     #[serde(default)]
     pub diff_start_sha: Option<String>,
+    /// Gerrit patch sets the review was opened with, kept so a reload or
+    /// submit refetches the same comparison.
+    #[serde(default)]
+    pub patch_sets: PatchSetRange,
 }
 
 impl PullRequestDetails {
@@ -325,6 +346,10 @@ pub struct PrSessionKey {
     pub repository: ForgeRepository,
     pub number: u64,
     pub head_sha: String,
+    /// Gerrit base patch set. Reviewing `base..head` is a different diff from
+    /// `parent..head`, so the two keep separate sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_patch_set: Option<u32>,
 }
 
 impl PrSessionKey {
@@ -333,15 +358,19 @@ impl PrSessionKey {
             repository,
             number,
             head_sha: head_sha.into(),
+            base_patch_set: None,
         }
     }
 
     pub fn from_details(details: &PullRequestDetails) -> Self {
-        Self::new(
-            details.repository.clone(),
-            details.number,
-            details.head_sha.clone(),
-        )
+        Self {
+            base_patch_set: details.patch_sets.base,
+            ..Self::new(
+                details.repository.clone(),
+                details.number,
+                details.head_sha.clone(),
+            )
+        }
     }
 
     /// Short, human-recognizable head SHA prefix used in filenames and UI.
