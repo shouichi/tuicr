@@ -110,6 +110,68 @@ pub struct DiffFile {
 }
 
 impl DiffHunk {
+    /// Splits the hunk into one hunk per run of added and removed lines, so
+    /// each run is reviewed on its own. A run takes the context lines above
+    /// it; context after the last run stays with that run.
+    pub fn split_at_change_runs(self) -> Vec<DiffHunk> {
+        let is_change = |line: &DiffLine| line.origin != LineOrigin::Context;
+        let mut groups: Vec<Vec<DiffLine>> = vec![Vec::new()];
+        for line in self.lines {
+            let current = groups.last_mut().expect("groups is never empty");
+            if !is_change(&line) && current.iter().any(is_change) {
+                groups.push(vec![line]);
+            } else {
+                current.push(line);
+            }
+        }
+        if groups.len() > 1
+            && !groups
+                .last()
+                .expect("groups is never empty")
+                .iter()
+                .any(is_change)
+        {
+            let trailing = groups.pop().expect("groups is never empty");
+            groups
+                .last_mut()
+                .expect("groups is never empty")
+                .extend(trailing);
+        }
+
+        let split = groups.len() > 1;
+        let suffix = self
+            .header
+            .strip_prefix("@@ ")
+            .and_then(|tail| tail.split_once(" @@"))
+            .map_or("", |(_, suffix)| suffix);
+        let (mut old_start, mut new_start) = (self.old_start, self.new_start);
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(idx, lines)| {
+                if idx > 0 {
+                    old_start = lines[0].old_lineno.unwrap_or(old_start);
+                    new_start = lines[0].new_lineno.unwrap_or(new_start);
+                }
+                let old_count = lines.iter().filter(|l| l.old_lineno.is_some()).count() as u32;
+                let new_count = lines.iter().filter(|l| l.new_lineno.is_some()).count() as u32;
+                let header = if !split {
+                    self.header.clone()
+                } else {
+                    format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}")
+                };
+                DiffHunk {
+                    header,
+                    lines,
+                    old_start,
+                    old_count,
+                    new_start,
+                    new_count,
+                }
+            })
+            .collect()
+    }
+
     fn review_content_hash(&self) -> u64 {
         let mut hasher = Fnv1aHasher::new();
         write_hunk_content_hash(&mut hasher, &self.lines);

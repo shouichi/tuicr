@@ -39,11 +39,17 @@ pub(super) fn file_header_prefix_text(app: &App, file: &DiffFile) -> String {
     if file.is_commit_message || app.is_pristine_mode {
         format!("═══ {}{} ", review_mark, path.display())
     } else {
+        let generated = if crate::tuicrignore::is_generated(path) {
+            "(generated) "
+        } else {
+            ""
+        };
         format!(
-            "═══ {}{} [{}] ",
+            "═══ {}{} [{}] {}",
             review_mark,
             path.display(),
-            file.status.as_char()
+            file.status.as_char(),
+            generated
         )
     }
 }

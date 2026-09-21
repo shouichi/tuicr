@@ -186,12 +186,13 @@ impl ReviewSession {
             let invalidated = Self::file_review_is_invalidated(review, content_hash);
             review.content_hash = Some(content_hash);
             if invalidated {
-                review.reviewed = false;
+                review.reviewed = crate::tuicrignore::is_generated(&path);
             }
             return invalidated;
         }
-        self.files
-            .insert(path.clone(), FileReview::new(path, status, content_hash));
+        let mut review = FileReview::new(path.clone(), status, content_hash);
+        review.reviewed = crate::tuicrignore::is_generated(&path);
+        self.files.insert(path, review);
         false
     }
 
