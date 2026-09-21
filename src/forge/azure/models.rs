@@ -179,6 +179,7 @@ impl AzPullRequest {
             closed,
             merged_at,
             diff_start_sha: None,
+            patch_sets: Default::default(),
         }
     }
 }
