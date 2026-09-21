@@ -34,3 +34,26 @@ of what this fork changes.
   file starts at its name row, a hunk at its header.
 - Moving to another hunk (`]`, `[`, or a hunk mark) lands on the hunk's first
   added or removed line instead of the context above it.
+
+## Release
+
+`shouichi/tuicr` ships its own binaries, because `~/.zsh/10-tuicr.zsh` installs
+them with zinit's `from"gh-r"`. To cut one:
+
+```
+TAG="shouichi-flavor-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+git tag "$TAG" && git push fork "$TAG"
+```
+
+`.github/workflows/shouichi-release.yml` then builds
+`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` and attaches them to a
+release of that tag; `zinit update shouichi/tuicr` picks it up. Upstream's
+`release.yml` is never run here — it publishes to crates.io.
+
+The tag is date + short SHA so that cutting one never means looking up the
+previous one. zinit does not compare version numbers: it scrapes the tag out of
+`/releases/latest` and re-downloads when the asset URL differs from the one in
+`._zinit/is_release`. So the tag only has to be new, and the release has to be
+the one GitHub marks Latest — hence `make_latest` in the workflow.
+`Cargo.toml`'s version stays at upstream's, so `tuicr --version` prints
+upstream's and the tag is what identifies the build.
