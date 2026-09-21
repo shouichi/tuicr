@@ -38,6 +38,7 @@ pub enum Action {
     // Review actions
     ToggleReviewed,
     ToggleHunkReviewed,
+    UndoReview,
     AddLineComment,
     AddFileComment,
     EditComment,
@@ -249,8 +250,9 @@ fn map_normal_mode_with_q_quits(key: KeyEvent, leader_key: char, q_quits: bool) 
         (KeyCode::Char('l') | KeyCode::Right, KeyModifiers::NONE) => Action::ScrollRight(4),
 
         // Review actions
-        (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ToggleReviewed,
-        (KeyCode::Char('R'), _) => Action::ToggleHunkReviewed,
+        (KeyCode::Char('r'), KeyModifiers::NONE) => Action::ToggleHunkReviewed,
+        (KeyCode::Char('R'), _) => Action::ToggleReviewed,
+        (KeyCode::Char('u'), KeyModifiers::NONE) => Action::UndoReview,
         (KeyCode::Char('c'), KeyModifiers::NONE) => Action::AddLineComment,
         (KeyCode::Char('C'), _) => Action::AddFileComment,
         (KeyCode::Char('i'), KeyModifiers::NONE) => Action::EditComment,
@@ -881,9 +883,15 @@ mod tests {
     }
 
     #[test]
-    fn should_map_uppercase_r_to_toggle_hunk_reviewed_in_normal_mode() {
-        let action = map_normal_mode(key_shift('R'), DEFAULT_LEADER_KEY);
+    fn should_map_r_to_toggle_hunk_reviewed_in_normal_mode() {
+        let action = map_normal_mode(key(KeyCode::Char('r')), DEFAULT_LEADER_KEY);
         assert_eq!(action, Action::ToggleHunkReviewed);
+    }
+
+    #[test]
+    fn should_map_uppercase_r_to_toggle_file_reviewed_in_normal_mode() {
+        let action = map_normal_mode(key_shift('R'), DEFAULT_LEADER_KEY);
+        assert_eq!(action, Action::ToggleReviewed);
     }
 
     #[test]

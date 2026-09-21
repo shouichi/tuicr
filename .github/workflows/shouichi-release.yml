@@ -1,0 +1,58 @@
+# shouichi-flavor only. Builds the binaries this fork installs from and
+# attaches them to a GitHub Release. Upstream's release.yml is left alone: it
+# runs `cargo publish`, which must never fire from this fork.
+name: shouichi-flavor Release
+
+on:
+  push:
+    # e.g. shouichi-flavor-20260921-8f380fe. The prefix keeps these apart
+    # from upstream's tags, which this workflow must never build.
+    tags: ['shouichi-flavor-*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.build_target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - build_target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - build_target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#shouichi-flavor-}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.build_target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.build_target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.build_target }}/release
+          tar -czvf ../../../tuicr-${{ steps.version.outputs.version }}-${{ matrix.build_target }}.tar.gz tuicr
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: tuicr-*.tar.gz
+          # zinit's gh-r resolves the version by scraping /releases/latest, so
+          # a release it skips is a release that never reaches the machines.
+          prerelease: false
+          make_latest: true

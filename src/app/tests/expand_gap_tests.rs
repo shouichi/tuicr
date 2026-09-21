@@ -145,9 +145,9 @@ fn assert_hunk_jumps_follow_rendered_headers(app: &mut App) {
     for pair in headers.windows(2) {
         app.diff_state.cursor_line = pair[0];
         app.next_hunk();
-        assert_eq!(app.diff_state.cursor_line, pair[1]);
+        assert_eq!(app.diff_state.cursor_line, app.hunk_entry_line(pair[1]));
         app.prev_hunk();
-        assert_eq!(app.diff_state.cursor_line, pair[0]);
+        assert_eq!(app.diff_state.cursor_line, app.hunk_entry_line(pair[0]));
     }
 }
 
@@ -508,8 +508,8 @@ fn should_report_when_no_comments_exist() {
 
 #[test]
 fn should_toggle_hunk_reviewed_from_header() {
-    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
-    let mut app = build_app_with_files(vec![file], 20);
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]);
+    let mut app = build_app_with_files(vec![file], 40);
     let path = app.diff_files[0].display_path().clone();
     let key = app.diff_files[0].hunk_review_key(0).unwrap();
 
@@ -521,13 +521,124 @@ fn should_toggle_hunk_reviewed_from_header() {
         app.message.as_ref().unwrap().content,
         "Hunk marked reviewed"
     );
+    // A mark finishes the hunk, so the cursor moves on to the next one.
     assert!(matches!(
         app.line_annotations[app.diff_state.cursor_line],
         AnnotatedLine::HunkHeader {
             file_idx: 0,
-            hunk_idx: 0
+            hunk_idx: 1
         }
     ));
+}
+
+#[test]
+fn should_land_hunk_motion_on_the_first_changed_line() {
+    let mut hunk = make_hunk(1, 3);
+    hunk.lines[1].origin = LineOrigin::Addition;
+    hunk.lines[1].old_lineno = None;
+    let file = make_file_with_hunks("test.rs", vec![hunk]);
+    let mut app = build_app_with_files(vec![file], 20);
+    app.diff_state.cursor_line = 0;
+
+    app.next_hunk();
+
+    assert!(
+        matches!(
+            app.line_annotations[app.diff_state.cursor_line],
+            AnnotatedLine::DiffLine {
+                file_idx: 0,
+                hunk_idx: 0,
+                line_idx: 1,
+                ..
+            }
+        ),
+        "expected the addition, got {:?}",
+        app.line_annotations[app.diff_state.cursor_line]
+    );
+}
+
+#[test]
+fn should_mark_the_file_reviewed_once_every_hunk_is() {
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]),
+        make_file_with_hunks("b.rs", vec![make_hunk(1, 3)]),
+    ];
+    let mut app = build_app_with_files(files, 40);
+    let path = app.diff_files[0].display_path().clone();
+
+    app.diff_state.cursor_line = app.hunk_header_line(0, 0).expect("missing hunk header");
+    app.toggle_hunk_reviewed();
+    assert!(
+        !app.session.is_file_reviewed(&path),
+        "one hunk left, the file is not done"
+    );
+
+    app.toggle_hunk_reviewed();
+
+    assert!(app.session.is_file_reviewed(&path), "all hunks done");
+    assert_eq!(
+        app.diff_state.current_file_idx, 1,
+        "a finished file moves the review on"
+    );
+}
+
+#[test]
+fn should_mark_the_hunk_below_a_file_name_row() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]);
+    let mut app = build_app_with_files(vec![file], 40);
+    let path = app.diff_files[0].display_path().clone();
+    let key = app.diff_files[0].hunk_review_key(0).unwrap();
+    app.diff_state.cursor_line = app
+        .line_annotations
+        .iter()
+        .position(|line| matches!(line, AnnotatedLine::FileHeader { file_idx: 0 }))
+        .expect("missing file header");
+
+    app.toggle_hunk_reviewed();
+
+    assert!(app.session.is_hunk_reviewed(&path, &key));
+}
+
+#[test]
+fn should_burn_the_review_down_with_repeated_hunk_marks() {
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]),
+        make_file_with_hunks("b.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]),
+    ];
+    let mut app = build_app_with_files(files, 40);
+    let a = app.diff_files[0].display_path().clone();
+    let b = app.diff_files[1].display_path().clone();
+    app.diff_state.cursor_line = app.hunk_header_line(0, 0).expect("missing hunk header");
+
+    // One key, held down: every hunk of every file, in order.
+    for _ in 0..4 {
+        app.toggle_hunk_reviewed();
+    }
+
+    assert!(app.session.is_file_reviewed(&a), "a.rs should be done");
+    assert!(app.session.is_file_reviewed(&b), "b.rs should be done");
+}
+
+#[test]
+fn should_undo_the_file_mark_that_came_with_the_last_hunk() {
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
+    let mut app = build_app_with_files(vec![file], 20);
+    let path = app.diff_files[0].display_path().clone();
+    let key = app.diff_files[0].hunk_review_key(0).unwrap();
+
+    app.diff_state.cursor_line = app.hunk_header_line(0, 0).expect("missing hunk header");
+    let cursor_before = app.diff_state.cursor_line;
+    app.toggle_hunk_reviewed();
+    assert!(app.session.is_file_reviewed(&path));
+
+    app.undo_last_review();
+
+    assert!(!app.session.is_hunk_reviewed(&path, &key));
+    assert!(
+        !app.session.is_file_reviewed(&path),
+        "the file mark came with the hunk, so it goes back with it"
+    );
+    assert_eq!(app.diff_state.cursor_line, cursor_before);
 }
 
 #[test]
@@ -544,19 +655,19 @@ fn should_toggle_hunk_reviewed_from_diff_line() {
 }
 
 #[test]
-fn should_warn_when_toggling_hunk_outside_hunk() {
+fn should_warn_when_no_hunk_is_left_below_the_cursor() {
     let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
     let mut app = build_app_with_files(vec![file], 20);
     let path = app.diff_files[0].display_path().clone();
     let key = app.diff_files[0].hunk_review_key(0).unwrap();
 
-    app.diff_state.cursor_line = 0;
+    app.diff_state.cursor_line = app.line_annotations.len();
     app.toggle_hunk_reviewed();
 
     assert!(!app.session.is_hunk_reviewed(&path, &key));
     assert_eq!(
         app.message.as_ref().unwrap().content,
-        "Move cursor to a hunk to toggle reviewed"
+        "No hunk left to mark reviewed"
     );
     assert_eq!(
         app.message.as_ref().unwrap().message_type,
@@ -616,8 +727,9 @@ fn should_fold_reviewed_hunk_body() {
 
 #[test]
 fn should_keep_file_and_hunk_reviewed_state_independent() {
-    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3)]);
-    let mut app = build_app_with_files(vec![file], 20);
+    // Two hunks, one marked: the file flag stays the user's to set.
+    let file = make_file_with_hunks("test.rs", vec![make_hunk(1, 3), make_hunk(20, 3)]);
+    let mut app = build_app_with_files(vec![file], 40);
     let path = app.diff_files[0].display_path().clone();
     let key = app.diff_files[0].hunk_review_key(0).unwrap();
 
@@ -1677,4 +1789,68 @@ fn should_not_show_eof_gap_for_deleted_files() {
 
     // and: total_lines must match annotations
     assert_eq!(app.total_lines(), app.line_annotations.len());
+}
+
+fn change_hunk(new_start: u32) -> DiffHunk {
+    let mut hunk = make_hunk(new_start, 3);
+    hunk.lines[1].origin = LineOrigin::Addition;
+    hunk.lines[1].old_lineno = None;
+    hunk
+}
+
+#[test]
+fn should_walk_every_hunk_when_gaps_render_between_them() {
+    // Gap expanders and spacing rows sit between these hunks; a motion that
+    // counts rows itself instead of reading the rendered lines drifts off
+    // the hunk and onto them.
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![change_hunk(1), change_hunk(20)]),
+        make_file_with_hunks("b.rs", vec![change_hunk(1), change_hunk(20)]),
+    ];
+    let mut app = build_app_with_files(files, 40);
+    app.diff_state.cursor_line = 0;
+
+    let mut visited = Vec::new();
+    for _ in 0..4 {
+        app.next_hunk();
+        match app.line_annotations[app.diff_state.cursor_line] {
+            AnnotatedLine::DiffLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+                ..
+            } => visited.push((file_idx, hunk_idx, line_idx)),
+            ref other => panic!("landed off the diff: {other:?}"),
+        }
+    }
+
+    // line_idx 1 is the added line of each hunk.
+    assert_eq!(visited, vec![(0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 1)]);
+}
+
+#[test]
+fn should_scroll_the_target_to_the_top_of_the_viewport() {
+    let files = vec![
+        make_file_with_hunks("a.rs", vec![change_hunk(1), change_hunk(20)]),
+        make_file_with_hunks("b.rs", vec![change_hunk(1), change_hunk(20)]),
+    ];
+    let mut app = build_app_with_files(files, 40);
+    app.diff_state.viewport_height = 10;
+    app.diff_state.cursor_line = 0;
+
+    app.next_hunk();
+    app.next_hunk();
+    let header = app.hunk_header_line(0, 1).expect("missing hunk header");
+    assert_eq!(
+        app.diff_state.scroll_offset, header,
+        "the hunk header should be the top line"
+    );
+    assert!(app.diff_state.cursor_line > header, "cursor on the change");
+
+    app.next_file();
+    assert_eq!(
+        app.diff_state.scroll_offset,
+        app.calculate_file_scroll_offset(1),
+        "the file name row should be the top line"
+    );
 }

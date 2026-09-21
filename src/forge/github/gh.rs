@@ -888,6 +888,24 @@ fn strip_git_suffix(value: &str) -> &str {
     value.strip_suffix(".git").unwrap_or(value)
 }
 
+pub(crate) fn checkout_pull_request(
+    checkout: &Path,
+    repository: &ForgeRepository,
+    number: u64,
+) -> crate::process::CommandOutputResult<String> {
+    crate::process::run_command_output(
+        "gh",
+        Some(checkout),
+        [
+            "pr".to_string(),
+            "checkout".to_string(),
+            number.to_string(),
+            "--repo".to_string(),
+            gh_repo_arg(repository),
+        ],
+    )
+}
+
 fn gh_repo_arg(repository: &ForgeRepository) -> String {
     if repository.host == DEFAULT_GITHUB_HOST {
         repository.slug()

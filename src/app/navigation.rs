@@ -832,6 +832,7 @@ impl App {
         if self.diff_state.cursor_line < self.review_comments_render_height() {
             if !self.diff_files.is_empty() {
                 self.jump_to_file(0);
+                self.park_cursor_on_file_header();
             }
             return;
         }
@@ -843,9 +844,22 @@ impl App {
                 && *file_idx > current_file_idx
             {
                 self.jump_to_file(*file_idx);
+                self.park_cursor_on_file_header();
                 return;
             }
         }
+    }
+
+    /// Puts the cursor on the current file's name row instead of its first
+    /// diff line, so entering a file shows which file it is. Single-file view
+    /// renders no such row.
+    pub(in crate::app) fn park_cursor_on_file_header(&mut self) {
+        if self.is_single_file_view {
+            return;
+        }
+        let header_line = self.calculate_file_scroll_offset(self.diff_state.current_file_idx);
+        self.diff_state.cursor_line = header_line;
+        self.diff_state.scroll_offset = header_line.min(self.max_scroll_offset());
     }
 
     pub fn prev_file(&mut self) {
@@ -874,18 +888,115 @@ impl App {
         None
     }
 
-    /// Render-line indices of every visible hunk header. Respects
-    /// single-file view (only the current file's hunks) and the
-    /// reviewed-collapse behavior in multi-file view (skipped entirely)
-    /// versus single-file view (body rendered under a banner).
+    /// Render-line indices of every rendered hunk header.
+    ///
+    /// Read off `line_annotations` rather than recomputed from file heights:
+    /// gap expanders, comment boxes and expanded context all take rows, and
+    /// any of them left out of the arithmetic slides the cursor off the hunk.
     pub(in crate::app) fn hunk_positions(&self) -> Vec<usize> {
         self.line_annotations
             .iter()
             .enumerate()
-            .filter_map(|(row, line)| {
-                matches!(line, AnnotatedLine::HunkHeader { .. }).then_some(row)
+            .filter_map(|(line, annotation)| {
+                matches!(annotation, AnnotatedLine::HunkHeader { .. }).then_some(line)
             })
             .collect()
+    }
+
+    /// Moves the cursor from the current file's name row down to its first
+    /// change, leaving the name row on screen. Nothing happens when the file
+    /// renders no hunk (collapsed, binary, or filtered out).
+    pub(in crate::app) fn park_cursor_on_first_hunk(&mut self) {
+        let file_idx = self.diff_state.current_file_idx;
+        let Some(first) = self.line_annotations.iter().position(|line| {
+            matches!(
+                line,
+                AnnotatedLine::HunkHeader { file_idx: candidate, .. } if *candidate == file_idx
+            )
+        }) else {
+            return;
+        };
+        // Keep the scroll where the name row put it: the cursor moving down
+        // into the body should not push the name off the top.
+        let scroll_offset = self.diff_state.scroll_offset;
+        self.diff_state.cursor_line = self.hunk_entry_line(first);
+        self.diff_state.scroll_offset = scroll_offset;
+    }
+
+    /// Lands a hunk motion: the cursor on the hunk's first change, the hunk
+    /// header scrolled to the top of the viewport so the whole hunk reads
+    /// downward from there.
+    fn land_on_hunk(&mut self, header_line: usize) {
+        self.diff_state.cursor_line = self.hunk_entry_line(header_line);
+        self.diff_state.scroll_offset = header_line.min(self.max_scroll_offset());
+        self.ensure_cursor_visible();
+        self.update_current_file_from_cursor();
+    }
+
+    /// Where a hunk motion should land: the hunk's first added or removed
+    /// line, so `]` stops on the change rather than the context above it.
+    /// Falls back to the header row when the body is collapsed or holds no
+    /// change lines.
+    pub(in crate::app) fn hunk_entry_line(&self, header_line: usize) -> usize {
+        let Some(AnnotatedLine::HunkHeader { file_idx, hunk_idx }) =
+            self.line_annotations.get(header_line)
+        else {
+            return header_line;
+        };
+        let (file_idx, hunk_idx) = (*file_idx, *hunk_idx);
+
+        for (line, annotation) in self
+            .line_annotations
+            .iter()
+            .enumerate()
+            .skip(header_line + 1)
+        {
+            match annotation {
+                AnnotatedLine::HunkHeader { .. } | AnnotatedLine::FileHeader { .. } => break,
+                AnnotatedLine::DiffLine {
+                    file_idx: candidate_file,
+                    hunk_idx: candidate_hunk,
+                    line_idx,
+                    ..
+                } => {
+                    if (*candidate_file, *candidate_hunk) != (file_idx, hunk_idx) {
+                        break;
+                    }
+                    if self.is_change_line(file_idx, hunk_idx, Some(*line_idx)) {
+                        return line;
+                    }
+                }
+                AnnotatedLine::SideBySideLine {
+                    file_idx: candidate_file,
+                    hunk_idx: candidate_hunk,
+                    del_line_idx,
+                    add_line_idx,
+                    ..
+                } => {
+                    if (*candidate_file, *candidate_hunk) != (file_idx, hunk_idx) {
+                        break;
+                    }
+                    if self.is_change_line(file_idx, hunk_idx, *del_line_idx)
+                        || self.is_change_line(file_idx, hunk_idx, *add_line_idx)
+                    {
+                        return line;
+                    }
+                }
+                _ => {}
+            }
+        }
+        header_line
+    }
+
+    fn is_change_line(&self, file_idx: usize, hunk_idx: usize, line_idx: Option<usize>) -> bool {
+        let Some(line_idx) = line_idx else {
+            return false;
+        };
+        self.diff_files
+            .get(file_idx)
+            .and_then(|file| file.hunks.get(hunk_idx))
+            .and_then(|hunk| hunk.lines.get(line_idx))
+            .is_some_and(|line| !matches!(line.origin, crate::model::LineOrigin::Context))
     }
 
     pub fn next_hunk(&mut self) {
@@ -897,9 +1008,7 @@ impl App {
         self.up_released_since_arm = false;
         for pos in self.hunk_positions() {
             if pos > self.diff_state.cursor_line {
-                self.diff_state.cursor_line = pos;
-                self.ensure_cursor_visible();
-                self.update_current_file_from_cursor();
+                self.land_on_hunk(pos);
                 return;
             }
         }
@@ -914,9 +1023,7 @@ impl App {
             if let Some(next_idx) = next_idx {
                 self.jump_to_file(next_idx);
                 if let Some(&first) = self.hunk_positions().first() {
-                    self.diff_state.cursor_line = first;
-                    self.ensure_cursor_visible();
-                    self.update_current_file_from_cursor();
+                    self.land_on_hunk(first);
                 }
             }
         }
@@ -929,10 +1036,12 @@ impl App {
         self.up_released_since_arm = false;
         let positions = self.hunk_positions();
         for &pos in positions.iter().rev() {
-            if pos < self.diff_state.cursor_line {
-                self.diff_state.cursor_line = pos;
-                self.ensure_cursor_visible();
-                self.update_current_file_from_cursor();
+            // Compare against the landing line, not the header: the cursor
+            // already sits on the current hunk's first change, so keying off
+            // the header would "move" it to where it already is.
+            let entry = self.hunk_entry_line(pos);
+            if entry < self.diff_state.cursor_line {
+                self.land_on_hunk(pos);
                 return;
             }
         }
@@ -946,9 +1055,7 @@ impl App {
         {
             self.jump_to_file(prev_idx);
             if let Some(&last) = self.hunk_positions().last() {
-                self.diff_state.cursor_line = last;
-                self.ensure_cursor_visible();
-                self.update_current_file_from_cursor();
+                self.land_on_hunk(last);
                 return;
             }
         }
