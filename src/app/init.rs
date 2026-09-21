@@ -579,6 +579,7 @@ impl App {
             compact_folders: false,
             is_pristine_mode: false,
             is_single_file_view: false,
+            review_undo: Vec::new(),
             revealed_reviewed_file: None,
             revealed_reviewed_hunk: None,
             primed_walk_next: false,
@@ -916,6 +917,12 @@ impl App {
             .as_deref()
             .and_then(|root| crate::forge::local_checkout_for_repo(root, &target_repo));
 
+        let checkout_warning = checkout_pr_branch(
+            &target_repo,
+            local_checkout_for_target.as_deref(),
+            parsed.number,
+        );
+
         let backend = create_forge_backend(
             &target_repo,
             local_checkout_for_target.clone(),
@@ -1000,6 +1007,9 @@ impl App {
             app.set_warning(format!("This PR is {reason} — review is read-only"));
         } else if let Some(message) = since_last_review_message {
             app.set_message(message);
+        }
+        if let Some(warning) = checkout_warning {
+            app.set_warning(warning);
         }
         // Spawn thread-fetch on startup; the main event loop will drain
         // the receiver via `poll_pr_threads_events` once it begins.
