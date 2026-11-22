@@ -2347,6 +2347,7 @@ mod tests {
             state: "OPEN".to_string(),
             closed: false,
             merged: false,
+            patch_sets: Default::default(),
         }))
     }
 

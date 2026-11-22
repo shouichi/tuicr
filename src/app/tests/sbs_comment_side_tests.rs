@@ -622,6 +622,7 @@ fn visual_suggestion_uses_gitlab_offsets_relative_to_range_end() {
             state: "OPEN".into(),
             closed: false,
             merged: false,
+            patch_sets: Default::default(),
         }));
         app.enter_suggestion_from_visual();
         assert_eq!(app.comment_buffer, expected);

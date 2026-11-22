@@ -348,6 +348,7 @@ fn pr_app(backend: FakeForgeBackend, files: Vec<DiffFile>) -> (App, String, Stri
         state: "OPEN".to_string(),
         closed: false,
         merged: false,
+        patch_sets: Default::default(),
     }));
     app.forge_backend = Some(Box::new(backend));
     app.focused_panel = FocusedPanel::FileList;

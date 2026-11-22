@@ -381,6 +381,7 @@ mod tests {
             state: "OPEN".to_string(),
             closed: false,
             merged: false,
+            patch_sets: Default::default(),
         };
         let mut app = App::build(
             Box::new(SnapshotVcs {

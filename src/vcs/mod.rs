@@ -358,19 +358,17 @@ fn apply_full_file_spans(
 /// Detect the VCS type and return the appropriate backend.
 ///
 /// Detection order: Jujutsu → Git → Mercurial.
-/// Jujutsu is tried first because jj repos are Git-backed.
+/// Jujutsu is tried first because jj repos are Git-backed. A Git repository
+/// nested inside a jj workspace, such as a `git worktree` under it, wins over
+/// the workspace, because its root is nearer.
 pub fn detect_vcs(
     git_backend_preference: GitBackendPreference,
     options: VcsDiffOptions,
 ) -> Result<Box<dyn VcsBackend>> {
-    // Try jj first since jj repos are Git-backed
-    if let Ok(backend) = JjBackend::discover(options.whitespace_mode.clone()) {
-        return Ok(Box::new(backend));
-    }
-
-    // Try git
-    if let Ok(backend) = GitBackend::discover(git_backend_preference, options.clone()) {
-        return Ok(Box::new(backend));
+    let jj = JjBackend::discover(options.whitespace_mode.clone());
+    let git = GitBackend::discover(git_backend_preference, options.clone());
+    if let Some(backend) = nearer_of(jj, git) {
+        return Ok(backend);
     }
 
     // Try hg
@@ -388,16 +386,32 @@ pub fn detect_vcs_in(
     git_backend_preference: GitBackendPreference,
     options: VcsDiffOptions,
 ) -> Result<Box<dyn VcsBackend>> {
-    if let Ok(backend) = JjBackend::discover_from(path, options.whitespace_mode.clone()) {
-        return Ok(Box::new(backend));
-    }
-    if let Ok(backend) = GitBackend::discover_from(path, git_backend_preference, options.clone()) {
-        return Ok(Box::new(backend));
+    let jj = JjBackend::discover_from(path, options.whitespace_mode.clone());
+    let git = GitBackend::discover_from(path, git_backend_preference, options.clone());
+    if let Some(backend) = nearer_of(jj, git) {
+        return Ok(backend);
     }
     if let Ok(backend) = HgBackend::discover_from(path, options.whitespace_mode) {
         return Ok(Box::new(backend));
     }
     Err(TuicrError::NotARepository)
+}
+
+/// jj unless a Git repository nested inside its workspace was found too.
+fn nearer_of(jj: Result<JjBackend>, git: Result<GitBackend>) -> Option<Box<dyn VcsBackend>> {
+    match (jj, git) {
+        (Ok(jj), Ok(git)) if nested_in(&git.info().root_path, &jj.info().root_path) => {
+            Some(Box::new(git))
+        }
+        (Ok(jj), _) => Some(Box::new(jj)),
+        (Err(_), Ok(git)) => Some(Box::new(git)),
+        (Err(_), Err(_)) => None,
+    }
+}
+
+/// Whether `inner` lies strictly inside `outer`.
+fn nested_in(inner: &Path, outer: &Path) -> bool {
+    inner != outer && inner.starts_with(outer)
 }
 
 #[cfg(test)]
@@ -444,6 +458,19 @@ mod tests {
             time: chrono::Utc::now(),
         };
         assert_eq!(commit.id, "abc");
+    }
+
+    #[test]
+    fn nested_in_is_true_only_strictly_inside() {
+        let jj = Path::new("/repo");
+        for (git, want) in [
+            ("/repo/.claude/worktrees/a", true),
+            ("/repo", false),
+            ("/repository", false),
+            ("/other", false),
+        ] {
+            assert_eq!(nested_in(Path::new(git), jj), want, "{git}");
+        }
     }
 
     #[test]

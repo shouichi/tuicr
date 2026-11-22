@@ -306,8 +306,9 @@ fn review_pane() -> Vec<Row> {
         bind([ch(' ')], A::ToggleExpand),
         bind([ch('o')], A::ExpandAll),
         bind([ch('O')], A::CollapseAll),
-        bind([ch('r')], A::ToggleReviewed),
-        bind([ch('R')], A::ToggleHunkReviewed),
+        bind([ch('r')], A::ToggleHunkReviewed),
+        bind([ch('R')], A::ToggleReviewed),
+        bind([ch('u')], A::UndoReview),
         bind([ch('c')], A::AddLineComment),
         bind([ch('C')], A::AddFileComment),
         bind([ch('i')], A::EditComment),
@@ -1152,7 +1153,7 @@ fn review() -> App {
 
     // Away from every edge, so each motion has room to show.
     app.next_file();
-    app.cursor_down(30);
+    app.cursor_down(32);
     app.scroll_right(4);
     app
 }
