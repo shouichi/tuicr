@@ -592,6 +592,7 @@ impl App {
             compact_folders: false,
             is_pristine_mode: false,
             is_single_file_view: false,
+            review_undo: Vec::new(),
             revealed_reviewed_file: None,
             revealed_reviewed_hunk: None,
             primed_walk_next: false,
@@ -894,8 +895,16 @@ impl App {
             display_options.show_checks,
             display_options.show_comments,
         );
+        let mut checkout_warning = None;
         let parsed = match parsed {
-            Some(parsed) => parsed,
+            Some(parsed) => {
+                checkout_warning = checkout_pr_branch(
+                    &target_repo,
+                    local_checkout_for_target.as_deref(),
+                    parsed.number,
+                );
+                parsed
+            }
             None => {
                 let branch = launch_dir
                     .as_deref()
@@ -939,6 +948,9 @@ impl App {
             local_repo_root,
             vcs_open_options,
         )?;
+        if let Some(warning) = checkout_warning {
+            app.set_warning(warning);
+        }
         // Spawn thread-fetch on startup; the main event loop will drain
         // the receiver via `poll_pr_threads_events` once it begins.
         app.spawn_pr_threads_fetch(&details_for_threads, local_checkout_for_target);

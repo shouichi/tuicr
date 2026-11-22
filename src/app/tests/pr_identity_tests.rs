@@ -63,6 +63,7 @@ fn build_pr_app(session: ReviewSession) -> App {
         state: "OPEN".to_string(),
         closed: false,
         merged: false,
+        patch_sets: Default::default(),
     };
     let vcs_info = VcsInfo {
         root_path: PathBuf::from("forge:ghe.internal/owner/repo"),
@@ -212,6 +213,7 @@ fn test_details(key: &PrSessionKey) -> crate::forge::traits::PullRequestDetails 
         closed: false,
         merged_at: None,
         diff_start_sha: None,
+        patch_sets: Default::default(),
     }
 }
 

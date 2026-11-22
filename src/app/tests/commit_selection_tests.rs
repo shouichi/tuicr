@@ -618,7 +618,7 @@ fn minimal_ui_starts_on_the_first_file_and_keeps_comment_rows() {
     assert!(app.diff_state.cursor_line > before);
     assert!(matches!(
         app.line_annotations[app.diff_state.cursor_line],
-        AnnotatedLine::HunkHeader { .. }
+        AnnotatedLine::DiffLine { .. }
     ));
 
     app.queue_editor_for_focused_item();

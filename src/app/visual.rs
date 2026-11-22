@@ -172,8 +172,10 @@ impl App {
         } else {
             "suggestion".to_string()
         };
-        // Require one hunk with a new-side source line on every selected code row.
-        let mut selected_hunk = None;
+        // Require one Git hunk with a new-side source line on every selected
+        // code row. This fork splits a Git hunk at each run of changes, so a
+        // selection may cross into the next run where its lines carry on.
+        let mut selected: Option<(usize, u32)> = None;
         for idx in start.annotation_idx..=end.annotation_idx {
             let hunk = match self.line_annotations.get(idx) {
                 Some(
@@ -181,6 +183,7 @@ impl App {
                 ) => {
                     continue;
                 }
+                Some(AnnotatedLine::HunkHeader { .. }) if selected.is_some() => continue,
                 Some(AnnotatedLine::DiffLine {
                     file_idx, hunk_idx, ..
                 })
@@ -189,16 +192,22 @@ impl App {
                 }) => Some((*file_idx, *hunk_idx)),
                 _ => None,
             };
-            if hunk.is_none()
-                || selected_hunk.is_some_and(|selected| Some(selected) != hunk)
-                || self.annotation_line_for_side(idx, LineSide::New).is_none()
-            {
+            let line = self.annotation_line_for_side(idx, LineSide::New);
+            let (Some(hunk), Some(line)) = (hunk, line) else {
+                self.set_warning(
+                    "Suggestions must stay within one diff hunk, without gaps or expanded context",
+                );
+                return;
+            };
+            let continues = selected
+                .is_none_or(|(prev_file, prev_line)| prev_file == hunk.0 && prev_line + 1 == line);
+            if !continues {
                 self.set_warning(
                     "Suggestions must stay within one diff hunk, without gaps or expanded context",
                 );
                 return;
             }
-            selected_hunk = hunk;
+            selected = Some((hunk.0, line));
         }
         let code = (start.annotation_idx..=end.annotation_idx)
             .filter_map(|idx| self.diff_line_for_side(idx, start.side))

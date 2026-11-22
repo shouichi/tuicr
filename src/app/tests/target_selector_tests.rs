@@ -352,6 +352,7 @@ fn test_pr_details(number: u64, title: &str) -> crate::forge::traits::PullReques
         closed: false,
         merged_at: None,
         diff_start_sha: None,
+        patch_sets: Default::default(),
     }
 }
 
@@ -2931,6 +2932,7 @@ fn should_surface_pr_open_error_to_message_bar_when_done_event_carries_error() {
     tx.send(crate::app::PrOpenEvent::Done {
         request,
         result: Err("auth failed".to_string()),
+        checkout_warning: None,
     })
     .unwrap();
     // when
@@ -2973,6 +2975,7 @@ fn should_ignore_stale_done_event_after_cancel() {
     tx.send(crate::app::PrOpenEvent::Done {
         request: stale_request,
         result: Err("would-have-failed".to_string()),
+        checkout_warning: None,
     })
     .unwrap();
     // when
@@ -3285,6 +3288,7 @@ fn configured_comments_visibility_seeds_the_async_pr_open_path() {
             crate::forge::traits::PullRequestReviewMetadata::default(),
             crate::forge::traits::PullRequestInfo::from_details(details.clone()),
         )),
+        checkout_warning: None,
     })
     .unwrap();
 
@@ -3507,6 +3511,7 @@ fn pr_open_landing_mid_delete_prompt_drops_the_prompt() {
             crate::forge::traits::PullRequestReviewMetadata::default(),
             crate::forge::traits::PullRequestInfo::from_details(details.clone()),
         )),
+        checkout_warning: None,
     })
     .unwrap();
     app.poll_pr_open_events();
